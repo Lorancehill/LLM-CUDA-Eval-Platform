@@ -1,0 +1,15 @@
+# 忽略密钥文件 (千万不能传)
+test_api.py
+*.env
+
+# 忽略编译生成的二进制文件
+baseline
+matrix_mul
+a.out
+
+# 忽略日志文件
+*.logA
+template
+-A
+-Wall
+*.exe
