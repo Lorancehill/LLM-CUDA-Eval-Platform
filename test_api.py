@@ -41,7 +41,7 @@ for attempt in range(max_retries):
         f.write(pure_code)
     print("✅ 代码已写入 matrix_mul.cu，准备送入沙箱测试...")
 
-    # 调用 Docker 沙箱（通过运行你的 auto_test.sh）
+    # 调用 Docker 沙箱（通过运行 auto_test.sh）
     result = subprocess.run(["bash", "auto_test.sh"], capture_output=True, text=True)
     
     # 检查评测结果
