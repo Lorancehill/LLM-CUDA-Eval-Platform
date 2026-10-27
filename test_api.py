@@ -67,7 +67,7 @@ for attempt in range(max_retries):
             if "Time:" in line or "耗时" in line:
                 print(line)
         print("----------------\n")
-        break  # 成功了就跳出循环，不重试了
+        break  # 成功了就跳出循环
 
 else:
     # 如果 3 次全失败了，会执行这里
