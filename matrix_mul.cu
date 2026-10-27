@@ -1,12 +1,10 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <chrono>
+#include <iostream>
+#include <cuda_runtime.h>
 
 #define N 1024
 #define TILE 16
 
-__global__ void matmul(float* A, float* B, float* C) {
+__global__ void matMul(const float* A, const float* B, float* C) {
     __shared__ float As[TILE][TILE];
     __shared__ float Bs[TILE][TILE];
     int row = blockIdx.y * TILE + threadIdx.y;
@@ -24,36 +22,46 @@ __global__ void matmul(float* A, float* B, float* C) {
 }
 
 int main() {
-    size_t bytes = (size_t)N * N * sizeof(float);
-    float *hA = (float*)malloc(bytes);
-    float *hB = (float*)malloc(bytes);
-    float *hC = (float*)malloc(bytes);
+    size_t bytes = N * N * sizeof(float);
+    float *h_A = (float*)malloc(bytes);
+    float *h_B = (float*)malloc(bytes);
+    float *h_C = (float*)malloc(bytes);
     for (int i = 0; i < N * N; ++i) {
-        hA[i] = 1.0f;
-        hB[i] = 2.0f;
+        h_A[i] = 1.0f;
+        h_B[i] = 1.0f;
     }
 
-    float *dA, *dB, *dC;
-    cudaMalloc(&dA, bytes);
-    cudaMalloc(&dB, bytes);
-    cudaMalloc(&dC, bytes);
-    cudaMemcpy(dA, hA, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, hB, bytes, cudaMemcpyHostToDevice);
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, bytes);
+    cudaMalloc(&d_B, bytes);
+    cudaMalloc(&d_C, bytes);
+    cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
 
     dim3 block(TILE, TILE);
     dim3 grid(N / TILE, N / TILE);
 
-    auto start = std::chrono::high_resolution_clock::now();
-    matmul<<<grid, block>>>(dA, dB, dC);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    matMul<<<grid, block>>>(d_A, d_B, d_C);
     cudaDeviceSynchronize();
-    auto end = std::chrono::high_resolution_clock::now();
 
-    cudaMemcpy(hC, dC, bytes, cudaMemcpyDeviceToHost);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
 
-    double elapsed = std::chrono::duration<double>(end - start).count();
-    printf("Time: %f seconds\n", elapsed);
+    cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
+    std::cout << "Time: " << ms / 1000.0f << " seconds" << std::endl;
 
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-    free(hA); free(hB); free(hC);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    free(h_A);
+    free(h_B);
+    free(h_C);
     return 0;
 }

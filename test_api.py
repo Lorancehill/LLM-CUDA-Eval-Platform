@@ -4,6 +4,7 @@ import subprocess
 import os
 from dotenv import load_dotenv
 
+
 load_dotenv() # 加载本地的 .env 文件
 
 client = OpenAI(
