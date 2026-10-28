@@ -6,76 +6,77 @@
 #define N 512
 #define TILE 16
 
-__global__ void matMul(const float* A, const float* B, float* C) {
+__global__ void matmul(const float* A, const float* B, float* C) {
     __shared__ float As[TILE][TILE];
     __shared__ float Bs[TILE][TILE];
 
+    int bx = blockIdx.x, by = blockIdx.y;
     int tx = threadIdx.x, ty = threadIdx.y;
-    int row = blockIdx.y * TILE + ty;
-    int col = blockIdx.x * TILE + tx;
+
+    int row = by * TILE + ty;
+    int col = bx * TILE + tx;
 
     float sum = 0.0f;
-    for (int t = 0; t < N / TILE; ++t) {
-        As[ty][tx] = A[row * N + t * TILE + tx];
-        Bs[ty][tx] = B[(t * TILE + ty) * N + col];
+    for (int m = 0; m < N / TILE; ++m) {
+        As[ty][tx] = A[row * N + m * TILE + tx];
+        Bs[ty][tx] = B[(m * TILE + ty) * N + col];
         __syncthreads();
 
         for (int k = 0; k < TILE; ++k)
             sum += As[ty][k] * Bs[k][tx];
-
         __syncthreads();
     }
     C[row * N + col] = sum;
 }
 
 int main() {
-    size_t bytes = (size_t)N * N * sizeof(float);
-    float *hA = new float[N * N];
-    float *hB = new float[N * N];
-    float *hC = new float[N * N];
+    size_t bytes = N * N * sizeof(float);
+
+    float *h_A = (float*)malloc(bytes);
+    float *h_B = (float*)malloc(bytes);
+    float *h_C = (float*)malloc(bytes);
 
     std::mt19937 gen(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     for (int i = 0; i < N * N; ++i) {
-        hA[i] = dist(gen);
-        hB[i] = dist(gen);
+        h_A[i] = dist(gen);
+        h_B[i] = dist(gen);
     }
 
-    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
-    cudaError_t err;
-    err = cudaMalloc((void**)&dA, bytes);
-    if (err != cudaSuccess) { std::cerr << "cudaMalloc dA: " << cudaGetErrorString(err) << std::endl; return 1; }
-    err = cudaMalloc((void**)&dB, bytes);
-    if (err != cudaSuccess) { std::cerr << "cudaMalloc dB: " << cudaGetErrorString(err) << std::endl; return 1; }
-    err = cudaMalloc((void**)&dC, bytes);
-    if (err != cudaSuccess) { std::cerr << "cudaMalloc dC: " << cudaGetErrorString(err) << std::endl; return 1; }
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, bytes);
+    cudaMalloc(&d_B, bytes);
+    cudaMalloc(&d_C, bytes);
 
-    cudaMemcpy(dA, hA, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, hB, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
 
-    dim3 block(TILE, TILE);
-    dim3 grid(N / TILE, N / TILE);
+    dim3 threads(TILE, TILE);
+    dim3 blocks(N / TILE, N / TILE);
 
+    cudaDeviceSynchronize();
     auto start = std::chrono::high_resolution_clock::now();
-    matMul<<<grid, block>>>(dA, dB, dC);
-    err = cudaDeviceSynchronize();
+
+    for (int i = 0; i < 100; ++i)
+        matmul<<<blocks, threads>>>(d_A, d_B, d_C);
+
+    cudaDeviceSynchronize();
     auto end = std::chrono::high_resolution_clock::now();
 
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        std::cerr << "Kernel error: " << cudaGetErrorString(err) << std::endl;
-        return 1;
+        std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
     }
 
-    std::chrono::duration<double> elapsed = end - start;
-    std::cout << "Time: " << elapsed.count() << " seconds" << std::endl;
+    double per_run = std::chrono::duration<double>(end - start).count() / 100.0;
+    std::cout << "Time: " << per_run << " seconds" << std::endl;
 
-    cudaMemcpy(hC, dC, bytes, cudaMemcpyDeviceToHost);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    free(h_A);
+    free(h_B);
+    free(h_C);
 
-    cudaFree(dA);
-    cudaFree(dB);
-    cudaFree(dC);
-    delete[] hA;
-    delete[] hB;
-    delete[] hC;
     return 0;
 }

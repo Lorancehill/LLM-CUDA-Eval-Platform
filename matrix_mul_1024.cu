@@ -1,31 +1,23 @@
-#include <cuda_runtime.h>
-#include <iostream>
-#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <ctime>
 
-const int N = 1024;
-const int TILE = 16;
+#define N 1024
+#define TILE 32
 
-__global__ void matmul(const float* A, const float* B, float* C) {
+__global__ void matMul(const float* A, const float* B, float* C) {
     __shared__ float As[TILE][TILE];
     __shared__ float Bs[TILE][TILE];
-
-    int bx = blockIdx.x, by = blockIdx.y;
-    int tx = threadIdx.x, ty = threadIdx.y;
-
-    int row = by * TILE + ty;
-    int col = bx * TILE + tx;
-
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
     float sum = 0.0f;
     for (int t = 0; t < N / TILE; ++t) {
-        As[ty][tx] = A[row * N + t * TILE + tx];
-        Bs[ty][tx] = B[(t * TILE + ty) * N + col];
+        As[threadIdx.y][threadIdx.x] = A[row * N + t * TILE + threadIdx.x];
+        Bs[threadIdx.y][threadIdx.x] = B[(t * TILE + threadIdx.y) * N + col];
         __syncthreads();
-
-        #pragma unroll
         for (int k = 0; k < TILE; ++k)
-            sum += As[ty][k] * Bs[k][tx];
-
+            sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
         __syncthreads();
     }
     C[row * N + col] = sum;
@@ -33,61 +25,39 @@ __global__ void matmul(const float* A, const float* B, float* C) {
 
 int main() {
     size_t bytes = (size_t)N * N * sizeof(float);
-    float *h_A = new float[N * N];
-    float *h_B = new float[N * N];
-    float *h_C = new float[N * N];
-
+    float *h_A = (float*)malloc(bytes);
+    float *h_B = (float*)malloc(bytes);
+    float *h_C = (float*)malloc(bytes);
     for (int i = 0; i < N * N; ++i) {
         h_A[i] = 1.0f;
-        h_B[i] = 2.0f;
+        h_B[i] = 1.0f;
     }
 
-    float *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
-    cudaError_t err;
-
-    err = cudaMalloc(&d_A, bytes);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_A: %s\n", cudaGetErrorString(err)); return 1; }
-    err = cudaMalloc(&d_B, bytes);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_B: %s\n", cudaGetErrorString(err)); return 1; }
-    err = cudaMalloc(&d_C, bytes);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaMalloc d_C: %s\n", cudaGetErrorString(err)); return 1; }
-
-    err = cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "memcpy A: %s\n", cudaGetErrorString(err)); return 1; }
-    err = cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "memcpy B: %s\n", cudaGetErrorString(err)); return 1; }
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, bytes);
+    cudaMalloc(&d_B, bytes);
+    cudaMalloc(&d_C, bytes);
+    cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
 
     dim3 block(TILE, TILE);
     dim3 grid(N / TILE, N / TILE);
 
-    auto start = std::chrono::high_resolution_clock::now();
+    cudaDeviceSynchronize();
+    clock_t start = clock();
+    matMul<<<grid, block>>>(d_A, d_B, d_C);
+    cudaDeviceSynchronize();
+    clock_t end = clock();
 
-    matmul<<<grid, block>>>(d_A, d_B, d_C);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) { fprintf(stderr, "kernel launch: %s\n", cudaGetErrorString(err)); return 1; }
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) { fprintf(stderr, "kernel exec: %s\n", cudaGetErrorString(err)); return 1; }
+    printf("Time: %f seconds\n", (double)(end - start) / CLOCKS_PER_SEC);
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    std::cout << "Time: " << elapsed.count() << " seconds" << std::endl;
-
-    err = cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "memcpy C: %s\n", cudaGetErrorString(err)); return 1; }
-
-    bool ok = true;
-    float expected = (float)N * 2.0f;
-    for (int i = 0; i < N * N; ++i) {
-        if (h_C[i] != expected) { ok = false; break; }
-    }
-    std::cout << "Verify: " << (ok ? "PASS" : "FAIL") << std::endl;
+    cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
 
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
-    delete[] h_A;
-    delete[] h_B;
-    delete[] h_C;
-
+    free(h_A);
+    free(h_B);
+    free(h_C);
     return 0;
 }

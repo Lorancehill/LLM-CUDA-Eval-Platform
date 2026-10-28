@@ -73,11 +73,3 @@ for attempt in range(max_retries):
 else:
     # 如果 3 次全失败了，会执行这里
     print("🚨 已达到最大重试次数，AI 依然未能生成正确代码。")
-
-
-response = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[
-        {"role": "user", "content": "请用C++和CUDA写一个1024*1024的矩阵乘法代码，要求包含生成随机数据的代码，使用CPU计时，并在最后打印出耗时。不要任何解释，只要代码"}
-    ]
-)
