@@ -1,0 +1,7 @@
+# 核心依赖：async_eval.py / validate.py / test_api.py
+numpy
+openai
+python-dotenv
+
+# 可选：仅 baseline_torch.py 需要，且依赖 CUDA GPU
+# torch
