@@ -15,8 +15,8 @@ docker run --rm -v $(pwd):/app --gpus all \
   --memory="2g" \
   --cpus="1.0" \
   --network none \
-  nvidia/cuda:12.0.0-devel-ubuntu22.04 \
-  bash -c "cd /app && timeout 15s nvcc matrix_mul.cu -o matrix_mul && echo  'CUDA 耗时：' && timeout 15s ./matrix_mul"
+  nvidia/cuda:12.8.2-devel-ubuntu22.04 \
+  bash -c "cd /app && timeout 15s nvcc -arch=sm_120 matrix_mul.cu -o matrix_mul && echo  'CUDA 耗时：' && timeout 15s ./matrix_mul"
 
 echo "--------------------------------"
 

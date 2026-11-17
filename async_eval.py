@@ -24,6 +24,15 @@ def parse_time_seconds(stdout_str):
 # Docker 沙箱运行超时上限（秒）
 TIMEOUT_SECONDS = 20
 
+# 沙箱镜像：必须支持 Blackwell (sm_120)，即 CUDA >= 12.8。
+# 12.0.x 不支持 RTX 5060 的 compute_120，编译出的内核无法在该 GPU 上运行。
+CUDA_IMAGE = "nvidia/cuda:12.8.2-devel-ubuntu22.04"
+# 首次拉取镜像的超时上限（秒）；镜像数 GB，需远大于执行超时
+PULL_TIMEOUT_SECONDS = 900
+# 拉取重试次数；Docker Hub 走 CDN，弱网下可能偶发 connection timed out，
+# docker pull 可断点续传，重试只补缺的层
+PULL_RETRIES = 3
+
 
 async def _docker_run(cmd, container_name):
     """在 TIMEOUT_SECONDS 内运行 docker 命令；超时则强杀容器并返回已捕获的部分输出。
@@ -50,9 +59,57 @@ async def _docker_run(cmd, container_name):
             pass
         return None, (e.stdout or b""), (e.stderr or b""), True
 
+
+async def ensure_image():
+    """评测前确保沙箱镜像已拉取。
+
+    docker run 首次遇到未缓存镜像会边跑边拉（数 GB），耗时远超 TIMEOUT_SECONDS，
+    导致每次 attempt 都被 20s 超时误杀。这里显式先拉取，把拉取与执行超时解耦。
+    返回 True 表示镜像可用，False 表示拉取失败（应中止评测）。
+    """
+    try:
+        r = await asyncio.to_thread(
+            subprocess.run,
+            ["docker", "image", "inspect", CUDA_IMAGE],
+            capture_output=True,
+            timeout=30,
+        )
+        if r.returncode == 0:
+            print(f"[镜像] {CUDA_IMAGE} 已缓存，跳过拉取。")
+            return True
+    except Exception:
+        pass
+
+    print(f"[镜像] 拉取 {CUDA_IMAGE}（首次较慢，请耐心等待）...")
+    for attempt in range(1, PULL_RETRIES + 1):
+        print(f"[镜像] 拉取尝试 {attempt}/{PULL_RETRIES} ...")
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "pull", CUDA_IMAGE],
+                capture_output=True,
+                timeout=PULL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[镜像] ⚠️ 拉取超时（>{PULL_TIMEOUT_SECONDS}s）。")
+            if attempt < PULL_RETRIES:
+                continue
+            print(f"[镜像] ❌ 多次超时。请手动执行：docker pull {CUDA_IMAGE}")
+            return False
+        if r.returncode == 0:
+            print("[镜像] ✅ 拉取完成。")
+            return True
+        print(f"[镜像] ⚠️ 拉取失败：{r.stderr.decode(errors='replace')[-300:]}")
+        if attempt < PULL_RETRIES:
+            print("[镜像] 断点续传重试中...")
+            continue
+    print(f"[镜像] ❌ 拉取 {PULL_RETRIES} 次均失败。请检查网络后手动执行：docker pull {CUDA_IMAGE}")
+    return False
+
+
 async def evaluate_matrix(matrix_size):
     messages = [
-        {"role": "user", "content": f"请用C++和CUDA写一个 {matrix_size}*{matrix_size} 的矩阵乘法代码。要求：\n1. 矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f；\n2. 包含CPU计时，并打印出 'Time: xxx seconds'；\n3. 打印 'C[0][0] = xxx' 用于结果校验；\n4. 将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output_{matrix_size}.bin'：fopen('cuda_output_{matrix_size}.bin','wb') 后 fwrite(C, sizeof(float), {matrix_size}*{matrix_size}, fp)。\n不要任何废话，只要代码。"}
+        {"role": "user", "content": f"请用C++和CUDA写一个 {matrix_size}*{matrix_size} 的矩阵乘法代码。要求：\n1. 矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f；\n2. 用 wall-clock 测量 kernel 执行耗时（用 std::chrono::high_resolution_clock 或 CUDA event，在 kernel 启动前后各调一次 cudaDeviceSynchronize；不要用 clock()，它测的是 CPU 时间），并打印出 'Time: xxx seconds'；\n3. 打印 'C[0][0] = xxx' 用于结果校验；\n4. 将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output_{matrix_size}.bin'：fopen('cuda_output_{matrix_size}.bin','wb') 后 fwrite(C, sizeof(float), {matrix_size}*{matrix_size}, fp)。\n不要任何废话，只要代码。"}
     ]
     max_retries = 3
 
@@ -89,7 +146,7 @@ async def evaluate_matrix(matrix_size):
 
         # 这里加了 --rm 自动清理容器，并执行编译和运行
         container_name = f"test_{matrix_size}_{attempt}"
-        cmd = f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none -v $(pwd):/app --gpus all nvidia/cuda:12.0.0-devel-ubuntu22.04 bash -c 'cd /app && nvcc {cu_filename} -o test_{matrix_size} && ./test_{matrix_size}'"
+        cmd = f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none -v $(pwd):/app --gpus all {CUDA_IMAGE} bash -c 'cd /app && nvcc -arch=sm_120 {cu_filename} -o test_{matrix_size} && ./test_{matrix_size}'"
         
         # 异步执行外部命令（GPU 串行，API 并发）
         async with gpu_sem:
@@ -166,6 +223,9 @@ async def main():
     sizes = [256, 512, 1024]
     
     print("================ 开始并发评测 ================")
+    if not await ensure_image():
+        print("================ 沙箱镜像不可用，评测中止 ================")
+        return
     # 使用 asyncio.gather 让这 3 个任务同时起飞
     tasks = [evaluate_matrix(size) for size in sizes]
     results = await asyncio.gather(*tasks)

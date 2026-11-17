@@ -15,7 +15,7 @@ client = OpenAI(
 )
 messages = [
     {"role": "user", "content": "请用C++和CUDA写一个 1024*1024 的矩阵乘法代码。 \
-     要求包含CPU计时，并且必须定义一个CHECK宏来检查所有CUDA API的返回值（如cudaMalloc,cudaMemcpy,kernel launch等）， \
+     要求用 wall-clock 计时测量 kernel 实际耗时（用 std::chrono::high_resolution_clock 或 CUDA event，不要用 clock()），并且必须定义一个CHECK宏来检查所有CUDA API的返回值（如cudaMalloc,cudaMemcpy,kernel launch等）， \
      并打印出 'Time: xxx seconds'。 \
      矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f，并打印 'C[0][0] = xxx' 用于结果校验。 \
      将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output.bin'：fopen('cuda_output.bin','wb') 后 fwrite(C, sizeof(float), 1024*1024, fp)。 \
