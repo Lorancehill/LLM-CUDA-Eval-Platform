@@ -21,6 +21,35 @@ def parse_time_seconds(stdout_str):
     m = re.search(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)", stdout_str)
     return float(m.group(1)) if m else None
 
+# Docker 沙箱运行超时上限（秒）
+TIMEOUT_SECONDS = 20
+
+
+async def _docker_run(cmd, container_name):
+    """在 TIMEOUT_SECONDS 内运行 docker 命令；超时则强杀容器并返回已捕获的部分输出。
+
+    返回 (returncode, stdout_bytes, stderr_bytes, timed_out)：
+    - 正常结束：returncode 为进程退出码，timed_out=False；
+    - 超时：returncode=None，stdout/stderr 为超时前已捕获的部分输出，timed_out=True。
+    """
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, shell=True, capture_output=True, timeout=TIMEOUT_SECONDS
+        )
+        return proc.returncode, proc.stdout, proc.stderr, False
+    except subprocess.TimeoutExpired as e:
+        # --rm 之外再兜底强杀一次，避免残留容器占用 GPU
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
+        return None, (e.stdout or b""), (e.stderr or b""), True
+
 async def evaluate_matrix(matrix_size):
     messages = [
         {"role": "user", "content": f"请用C++和CUDA写一个 {matrix_size}*{matrix_size} 的矩阵乘法代码。要求：\n1. 矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f；\n2. 包含CPU计时，并打印出 'Time: xxx seconds'；\n3. 打印 'C[0][0] = xxx' 用于结果校验；\n4. 将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output_{matrix_size}.bin'：fopen('cuda_output_{matrix_size}.bin','wb') 后 fwrite(C, sizeof(float), {matrix_size}*{matrix_size}, fp)。\n不要任何废话，只要代码。"}
@@ -59,46 +88,20 @@ async def evaluate_matrix(matrix_size):
             os.remove(out_bin)
 
         # 这里加了 --rm 自动清理容器，并执行编译和运行
-        cmd = f"docker run --rm --name test_{matrix_size}_{attempt} --memory=2g --cpus=1.0 --network none -v $(pwd):/app --gpus all nvidia/cuda:12.0.0-devel-ubuntu22.04 bash -c 'cd /app && nvcc {cu_filename} -o test_{matrix_size} && ./test_{matrix_size}'"
+        container_name = f"test_{matrix_size}_{attempt}"
+        cmd = f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none -v $(pwd):/app --gpus all nvidia/cuda:12.0.0-devel-ubuntu22.04 bash -c 'cd /app && nvcc {cu_filename} -o test_{matrix_size} && ./test_{matrix_size}'"
         
-        # 异步执行外部命令
+        # 异步执行外部命令（GPU 串行，API 并发）
         async with gpu_sem:
-            process = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            # 提前给变量赋初值，防止 NameError
-            stdout, stderr = b"", b""
-
             try:
-                # 强制设置 15 秒超时
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
-            except asyncio.TimeoutError:
-                subprocess.run(["docker", "rm", "-f", f"test_{matrix_size}_{attempt}"])
-                await process.wait()
-                # 如果超时，强制杀掉容器进程
-                try:
-                    process.kill()
-                except:
-                    pass # 防止进程已经死了导致 kill 报错
-                print(f"[{matrix_size}] ❌ 运行超时，已被系统强杀！")
-                timings.append(None)
-                messages.append({"role": "assistant", "content": raw_text})
-                messages.append({
-                    "role": "user",
-                    "content": f"你上次的 CUDA 代码在15秒内未跑完（超时）。可能是算法太慢（比如 naive 三重循环）或死循环。请优化 kernel， 再重新提供完整代码"
-                })
-                continue # 直接进入下一次重试循环
+                returncode, stdout, stderr, timed_out = await _docker_run(cmd, container_name)
             except Exception as e:
-            # 如果发生其他未知错误，也捕捉住，防止整个程序崩溃
-                print(f"[{matrix_size}] ❌ 发生未知错误: {e}")
-                timings.append(None)
-                continue
+                # docker 二进制缺失 / daemon 未启动等，也作为错误反馈给 DeepSeek
+                print(f"[{matrix_size}] ❌ Docker 启动失败: {e}")
+                returncode, stdout, stderr, timed_out = None, b"", str(e).encode(), False
 
-        # 只有 try 成功，或者捕获了非 Timeout 的普通异常后，才会走到这里
-        stdout_str = stdout.decode()
-        stderr_str = stderr.decode()
+        stdout_str = stdout.decode(errors="replace")
+        stderr_str = stderr.decode(errors="replace")
 
         # 记录本次 attempt 的内核耗时（秒）；无 'Time:' 输出记 None
         timings.append(parse_time_seconds(stdout_str))
@@ -116,12 +119,31 @@ async def evaluate_matrix(matrix_size):
         if not ok:
             print(f"[{matrix_size}] ❌ 第 {attempt + 1} 次评测失败！正在反馈给 AI...")
             messages.append({"role": "assistant", "content": raw_text})
-            if max_diff is None:
+
+            # 真正的自我纠错：把报错信息截取最后 300 个字符存进变量，喂回 DeepSeek
+            err_tail = stderr_str[-300:].strip()
+            out_tail = stdout_str[-300:].strip()
+
+            if timed_out:
                 error_feedback = (
-                    f"你上次写的代码编译或运行失败，没有输出结果矩阵 {out_bin}。\n"
-                    f"[stdout 尾部]\n{stdout_str[-300:]}\n"
-                    f"[stderr 尾部]\n{stderr_str[-300:]}\n"
-                    f"请仔细检查错误，修复后重新提供完整的 CUDA 代码。"
+                    f"你上次的 CUDA 代码在 {TIMEOUT_SECONDS} 秒内未跑完（超时被强杀）。\n"
+                    f"[运行输出尾部]\n{out_tail}\n"
+                    f"[错误输出尾部]\n{err_tail}\n"
+                    f"可能是算法太慢（如 naive 三重循环）或存在死循环，请优化 kernel 后重新提供完整代码。"
+                )
+            elif returncode is None or returncode != 0:
+                error_feedback = (
+                    f"你的代码在 Docker 沙箱中运行失败（退出码 {returncode}）。\n"
+                    f"[stdout 尾部]\n{out_tail}\n"
+                    f"[stderr 尾部]\n{err_tail}\n"
+                    f"请根据报错信息定位问题，修复后重新提供完整的 CUDA 代码。"
+                )
+            elif max_diff is None:
+                error_feedback = (
+                    f"你上次写的代码能编译运行，但没有输出结果矩阵 {out_bin}。\n"
+                    f"[stdout 尾部]\n{out_tail}\n"
+                    f"[stderr 尾部]\n{err_tail}\n"
+                    f"请确认 fwrite 写入了 {out_bin}，修复后重新提供完整的 CUDA 代码。"
                 )
             else:
                 error_feedback = (

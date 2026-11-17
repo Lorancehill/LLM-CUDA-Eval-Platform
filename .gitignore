@@ -7,6 +7,12 @@ matrix_mul
 a.out
 *.exe
 
+# 忽略测试生成的二进制可执行文件（async_eval.py: nvcc ... -o test_{size}）
+test_[0-9]*
+
+# 忽略测试生成的临时 CUDA 源码（async_eval.py / test_api.py 写入）
+matrix_mul*.cu
+
 # 忽略日志文件
 *.log
 
