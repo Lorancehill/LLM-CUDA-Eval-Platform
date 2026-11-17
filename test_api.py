@@ -4,6 +4,8 @@ import subprocess
 import os
 from dotenv import load_dotenv
 
+import validate
+
 
 load_dotenv() # 加载本地的 .env 文件
 
@@ -12,7 +14,13 @@ client = OpenAI(
     base_url="https://api.deepseek.com" 
 )
 messages = [
-    {"role": "user", "content": "请用C++和CUDA写一个 1024*1024 的矩阵乘法代码。要求包含CPU计时，并打印出 'Time: xxx seconds'。不要任何废话，只要代码。"}
+    {"role": "user", "content": "请用C++和CUDA写一个 1024*1024 的矩阵乘法代码。 \
+     要求包含CPU计时，并且必须定义一个CHECK宏来检查所有CUDA API的返回值（如cudaMalloc,cudaMemcpy,kernel launch等）， \
+     并打印出 'Time: xxx seconds'。 \
+     矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f，并打印 'C[0][0] = xxx' 用于结果校验。 \
+     将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output.bin'：fopen('cuda_output.bin','wb') 后 fwrite(C, sizeof(float), 1024*1024, fp)。 \
+     计时必须准确！在开始计时前，请务必调用cudaDeviceSynchronize()确保之前的任务已完成；在核函数启动后、停止计时前，必须再次调用cudaDeviceSynchronize()。 \
+     不要任何废话，只要代码。"}
 ]
 
 max_retries = 3  # 最多尝试 3 次（防止死循环）
@@ -42,28 +50,52 @@ for attempt in range(max_retries):
         f.write(pure_code)
     print("✅ 代码已写入 matrix_mul.cu，准备送入沙箱测试...")
 
-    # 调用 Docker 沙箱（通过运行 auto_test.sh）
+    # 清理上次的 CUDA 输出，避免读到过期矩阵
+    if os.path.exists("cuda_output.bin"):
+        os.remove("cuda_output.bin")
+
+    # 调用 Docker 沙箱（通过运行 auto_test.sh：C 基准 + CUDA）
     result = subprocess.run(["bash", "auto_test.sh"], capture_output=True, text=True)
-    
-    # 检查评测结果
-    if "Error" in result.stdout or "error" in result.stdout or "Traceback" in result.stderr or "Time:" not in result.stdout:
-        print(f"❌ 第 {attempt + 1} 次评测失败！AI 生成的代码有 Bug。")
-        print("正在收集错误日志，准备反馈给 AI 进行自我纠错...")
-        
-        # 把 AI 刚才写的烂代码和报错信息，追加到对话记录里
+
+    # 读取 C 基准与 CUDA 输出矩阵，用 numpy.allclose 做 1e-5 容差校验
+    N = 1024
+    if not os.path.exists("c_output.bin"):
+        raise SystemExit("c_output.bin 缺失：C 基准编译/运行失败，请检查 baseline.c / auto_test.sh。")
+
+    ok = False
+    max_diff = None
+    try:
+        ref = validate.load_matrix("c_output.bin", N)
+        if os.path.exists("cuda_output.bin"):
+            got = validate.load_matrix("cuda_output.bin", N)
+            ok, max_diff = validate.matrices_close(ref, got, rtol=1e-5, atol=1e-5)
+    except ValueError as e:
+        ok = False
+        print(f"⚠️ 矩阵读取/校验异常：{e}")
+
+    if not ok:
+        print(f"❌ 第 {attempt + 1} 次评测失败！")
         messages.append({"role": "assistant", "content": raw_text})
-        
-        # 提取报错信息（截取终端输出的最后一部分，防止太长）
-        error_feedback = f"你上次写的代码编译或运行失败了。终端输出如下：\n{result.stdout[-500:]}\n请仔细检查错误，修复后重新提供完整的 CUDA 代码。"
+        if max_diff is None:
+            # 编译/运行失败：没有产生有效的 cuda_output.bin
+            error_feedback = (
+                f"你上次写的代码编译或运行失败，没有输出结果矩阵 cuda_output.bin。\n"
+                f"[stdout 尾部]\n{result.stdout[-300:]}\n"
+                f"[stderr 尾部]\n{result.stderr[-300:]}\n"
+                f"请仔细检查错误，修复后重新提供完整的 CUDA 代码。"
+            )
+        else:
+            # 有输出但结果与基准不符
+            error_feedback = (
+                f"你上次写的代码能运行，但结果矩阵与 C 基准不符（最大绝对误差 {max_diff:.6g}，"
+                f"超过 1e-5 容差）。\n请检查矩阵乘法逻辑（索引、累加、边界），修复后重新提供完整的 CUDA 代码。"
+            )
         messages.append({"role": "user", "content": error_feedback})
-        
         print("🔄 正在将错误反馈发送给 AI，请稍候...")
         
     else:
-        # 如果没有报错，且输出了时间
-        print(f"🎉 第 {attempt + 1} 次评测成功！代码跑通！")
+        print(f"🎉 第 {attempt + 1} 次评测成功！结果与 C 基准一致（max diff {max_diff:.3g}）。")
         print("\n--- 跑分结果 ---")
-        # 只把带有 Time 的那行打印出来
         for line in result.stdout.split('\n'):
             if "Time:" in line or "耗时" in line:
                 print(line)
