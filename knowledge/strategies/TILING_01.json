@@ -1,7 +1,7 @@
 {
   "id": "TILING_01",
   "version": 1,
-  "status": "validated",
+  "status": "curated",
   "operator_family": ["matmul", "bmm", "gemm"],
   "semantics": {
     "shape": {"M": ">=64", "N": ">=64", "K": ">=64", "batch": ">=1"},
@@ -28,7 +28,7 @@
   "evidence": [
     {"source": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations", "note": "shared memory 分块复用减少全局内存访问"}
   ],
-  "confidence": 0.9,
+  "confidence": 0.6,
   "provenance": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations",
   "created_at": "2026-11-18",
   "last_validated": null

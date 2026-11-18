@@ -53,8 +53,9 @@ PROMPT_VERSION = "matmul_v1"
 # 多 kernel 代码里用 --kernel-name 过滤，避免误采 init/融合算子等第一个 launch。
 MATMUL_KERNEL_REGEX = r"(matmul|matMul|matrixMul|mat_mul|matrix_mul|sgemm|gemm)"
 
-# RAG 策略卡目录（RAG 设计 §1：knowledge/strategies/*.json）
-STRATEGY_DIR = os.path.join("knowledge", "strategies")
+# RAG 策略卡目录（RAG 设计 §1：knowledge/strategies/*.json）。
+# 用 rag.DEFAULT_STRATEGY_DIR（基于 __file__ 的绝对路径），避免 cwd 依赖（P0-1）。
+STRATEGY_DIR = rag.DEFAULT_STRATEGY_DIR
 
 
 def _knowledge_config():
@@ -315,6 +316,16 @@ def _empty_record(out_bin):
 async def evaluate_matrix(matrix_size, run_id, env_snapshot):
     kb = _knowledge_config()
     cards = rag.load_cards(STRATEGY_DIR) if kb["enabled"] else []
+    knowledge_warning = None
+    if kb["enabled"]:
+        if not cards:
+            knowledge_warning = (
+                f"KNOWLEDGE_ENABLED=1 但未加载到任何策略卡（目录 {STRATEGY_DIR}）；"
+                "本次运行退化为 no-KB 组"
+            )
+            print(f"[知识库] ⚠️ {knowledge_warning}")
+        else:
+            print(f"[知识库] 已加载 {len(cards)} 张策略卡")
     operator_spec = {
         "operator": "matmul",
         "shape": {"M": matrix_size, "N": matrix_size, "K": matrix_size, "batch": 1},
@@ -575,6 +586,15 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
 
     # 循环结束：只要有 best 就返回成功；后续 attempt 失败不会「反杀」已找到的最优
     timestamp = datetime.now(timezone.utc).isoformat()
+    knowledge = {
+        "enabled": kb["enabled"],
+        "mode": kb["mode"],
+        "top_k": kb["top_k"],
+        "cards_loaded": len(cards),
+        "retrieved_card_ids": sorted(retrieved_card_ids),
+    }
+    if knowledge_warning:
+        knowledge["warning"] = knowledge_warning
     payload = eval_logic.build_result_payload(
         run_id=run_id,
         timestamp=timestamp,
@@ -584,12 +604,7 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         best=best,
         records=records,
         env_snapshot=env_snapshot,
-        knowledge={
-            "enabled": kb["enabled"],
-            "mode": kb["mode"],
-            "top_k": kb["top_k"],
-            "retrieved_card_ids": sorted(retrieved_card_ids),
-        },
+        knowledge=knowledge,
     )
     try:
         path, index_path = eval_logic.persist_result(payload, RESULTS_DIR)

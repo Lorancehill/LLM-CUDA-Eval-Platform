@@ -118,8 +118,8 @@ def test_retrieve_sorted_by_score_and_breakdown():
     hits = rag.retrieve(SPEC, cards=cards)
     assert [h["card"]["id"] for h in hits] == ["HIGH", "LOW"]
     for h in hits:
-        assert set(h["score_breakdown"].keys()) == {"bm25_norm", "confidence", "recency"}
-        assert 0.0 <= h["score_breakdown"]["bm25_norm"] <= 1.0
+        assert set(h["score_breakdown"].keys()) == {"bm25_norm", "prior", "confidence", "recency"}
+        assert h["score_breakdown"]["bm25_norm"] == 0.0  # 首轮无瓶颈：BM25 置 0（P0-2）
 
 
 def test_build_context_block_empty():
@@ -172,6 +172,45 @@ def test_distill_failure_returns_none():
 def test_distill_no_speedup_returns_none():
     rec = {"ok": True, "speedup": 0.8, "operator_spec": SPEC}
     assert rag.distill_from_run(rec) is None
+
+
+def test_tokenize_filters_single_char_tokens():
+    toks = rag._tokenize("M=1024 N=1024 K=1024 batch=1 float32")
+    assert all(len(t) >= 2 for t in toks)
+    assert "m" not in toks and "n" not in toks and "k" not in toks
+    assert "1024" in toks and "float32" in toks
+
+
+def test_build_query_text_has_no_single_letter_dim_tokens():
+    q = rag._build_query_text(SPEC, None, None)
+    assert "M=" not in q and "N=" not in q and "K=" not in q  # 不再有裸单字母维度
+    assert all(len(t) >= 2 for t in rag._tokenize(q))
+
+
+def test_default_strategy_dir_is_absolute_and_loads_cards():
+    assert os.path.isabs(rag.DEFAULT_STRATEGY_DIR)
+    cards = rag.load_cards(rag.DEFAULT_STRATEGY_DIR)
+    assert len(cards) >= 5
+
+
+def test_first_round_tiling_in_top2_across_sizes():
+    # P0-2 回归：不同尺寸下首轮（无瓶颈）TILING 都应在 top-2，排序稳定不随尺寸漂移。
+    cards = rag.load_cards(rag.DEFAULT_STRATEGY_DIR)
+    for size in (256, 1024):
+        spec = {"operator": "matmul",
+                "shape": {"M": size, "N": size, "K": size, "batch": 1},
+                "dtype": "float32"}
+        hits = rag.retrieve(spec, cards=cards, top_k=3)
+        ids = [h["card"]["id"] for h in hits]
+        assert "TILING_01" in ids[:2], f"size={size}: TILING_01 不在首轮 top-2，实际 {ids}"
+
+
+def test_bottleneck_round_uses_bm25_without_prior():
+    card = make_card("C1", bottleneck=["memory"])
+    hits = rag.retrieve(SPEC, bottleneck="memory", cards=[card])
+    assert len(hits) == 1
+    assert set(hits[0]["score_breakdown"].keys()) == {"bm25_norm", "confidence", "recency"}
+    assert 0.0 <= hits[0]["score_breakdown"]["bm25_norm"] <= 1.0
 
 
 if __name__ == "__main__":

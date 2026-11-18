@@ -27,6 +27,20 @@ W_BM25 = 0.5
 W_CONFIDENCE = 0.35
 W_RECENCY = 0.15
 
+# 首轮（bottleneck=None）没有真实检索信号，用「策略先验」替代 BM25（P0-2）。
+# 权重与 W_BM25 同位（替换而非叠加）。
+W_PRIOR = 0.5
+
+# 策略先验（按 transform.name）：无瓶颈画像时按「基础 → 进阶」的通用性排序，
+# 保证同一策略在不同尺寸下首轮注入顺序稳定。未列出的 transform 用默认 0.5。
+STRATEGY_PRIOR = {
+    "shared_memory_tiling": 0.9,
+    "vectorized_load": 0.8,
+    "split_k": 0.7,
+    "register_tiling": 0.6,
+    "double_buffering": 0.5,
+}
+
 # 近因衰减半衰期（天）：last_validated/created_at 距今这么久后 recency 衰减到 0.5
 RECENCY_HALF_LIFE_DAYS = 180.0
 
@@ -79,6 +93,13 @@ def _eval_constraint(value, expr) -> bool:
     return False
 
 
+# 默认策略卡目录：基于本文件绝对路径（而非进程 cwd），
+# 换工作目录/定时任务/绝对路径运行时不会静默加载不到卡（P0-1）。
+DEFAULT_STRATEGY_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "knowledge", "strategies"
+)
+
+
 def load_cards(card_dir: str) -> list[dict]:
     """加载 card_dir 下所有 *.json 策略卡，按路径排序返回；目录缺失返回 []。"""
     cards = []
@@ -89,8 +110,12 @@ def load_cards(card_dir: str) -> list[dict]:
 
 
 def _tokenize(text: str) -> list[str]:
-    """英文/数字/下划线分词（MVP 不做中文分词：查询与卡片的英文字段即可匹配）。"""
-    return _TOKEN_RE.findall((text or "").lower())
+    """英文/数字/下划线分词（MVP 不做中文分词：查询与卡片的英文字段即可匹配）。
+
+    过滤长度 <2 的 token：M/N/K/1 等单字符是 BM25 噪声，会匹配卡片文本里的杂散字母
+    并扭曲排序（P0-2）。
+    """
+    return [t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) >= 2]
 
 
 def _operator_family_match(card: dict, operator_spec: dict) -> bool:
@@ -142,7 +167,9 @@ def _build_query_text(operator_spec, bottleneck, source_features) -> str:
     parts = [operator_spec.get("operator") or operator_spec.get("family") or ""]
     shape = operator_spec.get("shape") or {}
     if shape:
-        parts.append(" ".join(f"{k}={v}" for k, v in sorted(shape.items())))
+        # 维度名加 dim_ 前缀并转小写，避免 M=/N=/K= 产生单字母 token（P0-2）；
+        # 残余单字母再由 _tokenize 的 len>=2 过滤兜底。
+        parts.append(" ".join(f"dim_{str(k).lower()}={v}" for k, v in sorted(shape.items())))
     if operator_spec.get("dtype"):
         parts.append(str(operator_spec["dtype"]))
     if bottleneck:
@@ -236,23 +263,28 @@ def retrieve(operator_spec, bottleneck=None, source_features=None, ncu_metrics=N
         scored.append(card)
     if not scored:
         return []
-    query_terms = _tokenize(_build_query_text(operator_spec, bottleneck, source_features))
-    bm25_scores = _bm25(query_terms, [_tokenize(_card_doc_text(c)) for c in scored])
-    max_bm25 = max(bm25_scores) if bm25_scores else 0.0
+    first_round = bottleneck is None
+    if first_round:
+        # 首轮无瓶颈画像，BM25 无真实检索信号（P0-2）：置 0，改按 confidence + 策略先验排序。
+        bm25_scores = [0.0] * len(scored)
+        max_bm25 = 0.0
+    else:
+        query_terms = _tokenize(_build_query_text(operator_spec, bottleneck, source_features))
+        bm25_scores = _bm25(query_terms, [_tokenize(_card_doc_text(c)) for c in scored])
+        max_bm25 = max(bm25_scores) if bm25_scores else 0.0
     hits = []
     for card, bm in zip(scored, bm25_scores):
         bm25_norm = (bm / max_bm25) if max_bm25 > 0 else 0.0
         conf = float(card.get("confidence", 0.5))
         rec = _card_recency(card)
-        hits.append({
-            "card": card,
-            "score": W_BM25 * bm25_norm + W_CONFIDENCE * conf + W_RECENCY * rec,
-            "score_breakdown": {
-                "bm25_norm": bm25_norm,
-                "confidence": conf,
-                "recency": rec,
-            },
-        })
+        breakdown = {"bm25_norm": bm25_norm, "confidence": conf, "recency": rec}
+        if first_round:
+            prior = STRATEGY_PRIOR.get((card.get("transform") or {}).get("name", ""), 0.5)
+            breakdown["prior"] = prior
+            score = W_PRIOR * prior + W_CONFIDENCE * conf + W_RECENCY * rec
+        else:
+            score = W_BM25 * bm25_norm + W_CONFIDENCE * conf + W_RECENCY * rec
+        hits.append({"card": card, "score": score, "score_breakdown": breakdown})
     hits.sort(key=lambda h: h["score"], reverse=True)
     return hits[:top_k]
 
