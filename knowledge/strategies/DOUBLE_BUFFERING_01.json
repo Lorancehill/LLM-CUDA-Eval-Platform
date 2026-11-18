@@ -1,0 +1,34 @@
+{
+  "id": "DOUBLE_BUFFERING_01",
+  "version": 1,
+  "status": "validated",
+  "operator_family": ["matmul", "bmm", "gemm"],
+  "semantics": {
+    "shape": {"M": ">=64", "N": ">=64", "K": ">=64", "batch": ">=1"},
+    "dtype": "float32",
+    "tolerance": "default"
+  },
+  "fingerprint": {
+    "bottleneck": ["latency"],
+    "source_features": {"has_shared_mem": true},
+    "ncu_ranges": {"sm_util": "< 40"}
+  },
+  "transform": {
+    "name": "double_buffering",
+    "description": "双缓冲（软件流水线）：用两组共享内存交替加载/计算，让下一次 tile 的加载与本次计算重叠，隐藏访存延迟。",
+    "code_hint": "// __shared__ float As[2][TILE][TILE], Bs[2][TILE][TILE];\n// ping-pong: load buffer[buf^1] while computing on buffer[buf], then __syncthreads()",
+    "params": {"stages": [2, 3]}
+  },
+  "expected_gain": "1.2x-2x（延迟受限场景）",
+  "failure_modes": [
+    "共享内存不足（双份 buffer 占用翻倍）",
+    "流水线阶段过多增加寄存器压力导致 spill"
+  ],
+  "evidence": [
+    {"source": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations", "note": "重叠访存与计算隐藏延迟"}
+  ],
+  "confidence": 0.65,
+  "provenance": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations",
+  "created_at": "2026-11-18",
+  "last_validated": null
+}

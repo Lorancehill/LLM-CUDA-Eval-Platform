@@ -39,7 +39,7 @@ def sanitize_float(v: float | None) -> float | None:
 
 
 def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_version,
-                         best, records, env_snapshot):
+                         best, records, env_snapshot, knowledge=None):
     """构造 results schema v2 的落盘 payload（纯函数，不做 I/O）。
 
     schema v2 相比 v1 新增：run_id / timestamp / model 真实名（response.model，逐轮在
@@ -77,6 +77,7 @@ def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_vers
         "prompt_version": prompt_version,
         "env": env_snapshot,
         "success": bool(best.get("ok")),
+        "knowledge": knowledge,
         "best": clean_best(best),
         "attempts": [clean_record(r) for r in records],
     }

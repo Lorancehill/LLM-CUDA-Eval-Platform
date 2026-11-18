@@ -1,0 +1,35 @@
+{
+  "id": "TILING_01",
+  "version": 1,
+  "status": "validated",
+  "operator_family": ["matmul", "bmm", "gemm"],
+  "semantics": {
+    "shape": {"M": ">=64", "N": ">=64", "K": ">=64", "batch": ">=1"},
+    "dtype": "float32",
+    "tolerance": "default"
+  },
+  "fingerprint": {
+    "bottleneck": ["memory"],
+    "source_features": {"has_shared_mem": false},
+    "ncu_ranges": {"dram_util": "> 40", "sm_util": "< 60"}
+  },
+  "transform": {
+    "name": "shared_memory_tiling",
+    "description": "用 __shared__ 做分块（Tiling），把 A/B 的 tile 先加载进共享内存再在内层 K 循环复用，消除每个线程反复从全局内存读同一数据。",
+    "code_hint": "// __shared__ float As[TILE][TILE], Bs[TILE][TILE];\n// each block: load A/B tile from global -> __syncthreads() -> compute C tile;\n// reuse As/Bs across the inner-K loop to cut global-memory traffic",
+    "params": {"TILE": [16, 32], "block_size": [16, 32]}
+  },
+  "expected_gain": "2x-10x（相对 naive 全局内存实现）",
+  "failure_modes": [
+    "TILE 过大导致 shared memory 溢出（每 SM 上限约 100KB）",
+    "只分块不复用（K 维仍重复读全局）无收益",
+    "漏写 __syncthreads 导致数据竞争"
+  ],
+  "evidence": [
+    {"source": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations", "note": "shared memory 分块复用减少全局内存访问"}
+  ],
+  "confidence": 0.9,
+  "provenance": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations",
+  "created_at": "2026-11-18",
+  "last_validated": null
+}

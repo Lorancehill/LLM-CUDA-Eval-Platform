@@ -1,0 +1,35 @@
+{
+  "id": "SPLIT_K_01",
+  "version": 1,
+  "status": "validated",
+  "operator_family": ["matmul", "gemm"],
+  "semantics": {
+    "shape": {"M": ">=128", "N": ">=128", "K": ">=512", "batch": ">=1"},
+    "dtype": "float32",
+    "tolerance": "default"
+  },
+  "fingerprint": {
+    "bottleneck": ["latency", "memory"],
+    "source_features": {"has_shared_mem": true},
+    "ncu_ranges": {"sm_util": "< 50"}
+  },
+  "transform": {
+    "name": "split_k",
+    "description": "沿 K 维切分为 SPLIT_K 份并行计算，多 block 各自累加后 atomicAdd 归约，增加并行度、缩短单 kernel 时间。",
+    "code_hint": "// grid.z = SPLIT_K; each block accumulates a K/SPLIT_K slice, then atomicAdd into C\n// note: fp32 atomic accumulation changes summation order; keep within tolerance",
+    "params": {"SPLIT_K": [2, 4, 8], "block_size": [16, 32]}
+  },
+  "expected_gain": "1.1x-2.0x（并行度受限场景）",
+  "failure_modes": [
+    "K < 512 时归约开销 > 收益",
+    "atomicAdd 求和顺序不确定，可能超出容差",
+    "占用率已很高时无收益"
+  ],
+  "evidence": [
+    {"source": "CUDA C Best Practices Guide, Ch.10 Execution Configuration Optimizations", "note": "K 维并行（split-K）"}
+  ],
+  "confidence": 0.6,
+  "provenance": "CUDA C Best Practices Guide, Ch.10 Execution Configuration Optimizations",
+  "created_at": "2026-11-18",
+  "last_validated": null
+}

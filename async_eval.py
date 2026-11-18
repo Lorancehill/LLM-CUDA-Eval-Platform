@@ -13,6 +13,7 @@ import validate
 import profiler
 import roofline
 import eval_logic
+import rag
 
 load_dotenv()
 
@@ -52,9 +53,26 @@ PROMPT_VERSION = "matmul_v1"
 # 多 kernel 代码里用 --kernel-name 过滤，避免误采 init/融合算子等第一个 launch。
 MATMUL_KERNEL_REGEX = r"(matmul|matMul|matrixMul|mat_mul|matrix_mul|sgemm|gemm)"
 
+# RAG 策略卡目录（RAG 设计 §1：knowledge/strategies/*.json）
+STRATEGY_DIR = os.path.join("knowledge", "strategies")
 
-def build_prompt(matrix_size):
-    return (
+
+def _knowledge_config():
+    """读取 RAG 消融开关（设计 §4）。默认关闭，保持与引入 RAG 前行为一致。
+
+    - KNOWLEDGE_ENABLED=1/0：知识库开/关（消融主开关）
+    - KNOWLEDGE_TOPK：每次注入的策略卡条数（默认 3）
+    - mode 固定 'cards'：MVP 仅实现策略卡检索；docs/hybrid 为升级路径（设计 §3.1），未实现。
+    """
+    return {
+        "enabled": os.getenv("KNOWLEDGE_ENABLED", "0") in ("1", "true", "True", "yes", "on"),
+        "top_k": int(os.getenv("KNOWLEDGE_TOPK", "3") or "3"),
+        "mode": "cards",
+    }
+
+
+def build_prompt(matrix_size, knowledge_block=None):
+    reqs = (
         f"请用C++和CUDA写一个 {matrix_size}*{matrix_size} 的矩阵乘法代码。要求：\n"
         "1. 矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f；\n"
         "2. 用 wall-clock 测量 kernel 执行耗时（用 std::chrono::high_resolution_clock 或 CUDA event，"
@@ -63,8 +81,12 @@ def build_prompt(matrix_size):
         "3. 打印 'C[0][0] = xxx' 用于结果校验；\n"
         f"4. 将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output_{matrix_size}.bin'："
         f"fopen('cuda_output_{matrix_size}.bin','wb') 后 fwrite(C, sizeof(float), {matrix_size}*{matrix_size}, fp)。\n"
-        "不要任何废话，只要代码。"
     )
+    if knowledge_block:
+        # 知识库检索结果放在靠后位置（RAG 设计 §5.4：靠后 + 显式引用要求）
+        reqs += "\n" + knowledge_block + "\n"
+    reqs += "不要任何废话，只要代码。"
+    return reqs
 
 
 async def _docker_run(cmd, container_name, timeout=TIMEOUT_SECONDS):
@@ -279,6 +301,7 @@ def _empty_record(out_bin):
         "metrics": None,
         "feedback": None,
         "code": None,
+        "retrieved_card_ids": None,
         "error_feedback": None,
         "compile_stdout_tail": None,
         "compile_stderr_tail": None,
@@ -290,7 +313,28 @@ def _empty_record(out_bin):
 
 
 async def evaluate_matrix(matrix_size, run_id, env_snapshot):
-    messages = [{"role": "user", "content": build_prompt(matrix_size)}]
+    kb = _knowledge_config()
+    cards = rag.load_cards(STRATEGY_DIR) if kb["enabled"] else []
+    operator_spec = {
+        "operator": "matmul",
+        "shape": {"M": matrix_size, "N": matrix_size, "K": matrix_size, "batch": 1},
+        "dtype": "float32",
+    }
+    # 本次 run 检索到的策略卡 id 集合（落盘 results 的 knowledge 字段，供消融回溯）
+    retrieved_card_ids = set()
+
+    def retrieve_hits(bottleneck=None, source_features=None, ncu_metrics=None):
+        if not kb["enabled"]:
+            return []
+        return rag.retrieve(operator_spec, bottleneck=bottleneck, source_features=source_features,
+                            ncu_metrics=ncu_metrics, top_k=kb["top_k"], cards=cards)
+
+    # 首轮注入（RAG 设计 §3.3）：尚未画像，仅按算子规格检索该算子族的常用优化手段
+    first_hits = retrieve_hits()
+    knowledge_block = rag.build_context_block(first_hits) if first_hits else None
+    for h in first_hits:
+        retrieved_card_ids.add(h["card"]["id"])
+    messages = [{"role": "user", "content": build_prompt(matrix_size, knowledge_block)}]
     max_retries = 3
 
     # 参考结果（float64，见 validate.reference_matmul）
@@ -479,6 +523,19 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         record["metrics"] = metrics
         record["feedback"] = feedback
 
+        # 画像后检索（RAG 设计 §3.3）：按瓶颈指纹 + 源码特征检索策略卡，
+        # 供下一轮反馈注入；结果记入 record 的 retrieved_card_ids 证据链
+        fb_hits = []
+        knowledge_feedback = None
+        if label in ("memory", "compute", "latency"):
+            feats = roofline.source_features(pure_code)
+            ncu_metrics = metrics if source == "ncu" else None
+            fb_hits = retrieve_hits(bottleneck=label, source_features=feats, ncu_metrics=ncu_metrics)
+            for h in fb_hits:
+                retrieved_card_ids.add(h["card"]["id"])
+            knowledge_feedback = rag.build_context_block(fb_hits) if fb_hits else None
+        record["retrieved_card_ids"] = [h["card"]["id"] for h in fb_hits]
+
         # best-so-far 更新：仅当「正确且更快」才更新（更快优先用 ncu 可信计时）
         effective_time = ncu_time_sec if ncu_time_sec is not None else time_sec
         if eval_logic.should_update_best(best["ok"], best["effective_time"], effective_time):
@@ -505,9 +562,12 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
 
         # 瓶颈识别 → 策略选择 → 自动迭代：memory/compute/latency 三类瓶颈都要接策略继续优化
         if label in ("memory", "compute", "latency") and attempt + 1 < max_retries:
+            feedback_msg = feedback
+            if knowledge_feedback:
+                feedback_msg = feedback + "\n\n" + knowledge_feedback
             messages.append({"role": "assistant", "content": raw_text})
-            messages.append({"role": "user", "content": feedback})
-            print(f"[{matrix_size}] 🔄 检测到 {label} 瓶颈，已反馈给 AI 继续优化...")
+            messages.append({"role": "user", "content": feedback_msg})
+            print(f"[{matrix_size}] 🔄 检测到 {label} 瓶颈，检索到 {len(fb_hits)} 张策略卡，已反馈给 AI 继续优化...")
             continue
 
         # 无瓶颈（unknown / 画像缺失）→ 没有有效策略可反馈，停止迭代
@@ -524,6 +584,12 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         best=best,
         records=records,
         env_snapshot=env_snapshot,
+        knowledge={
+            "enabled": kb["enabled"],
+            "mode": kb["mode"],
+            "top_k": kb["top_k"],
+            "retrieved_card_ids": sorted(retrieved_card_ids),
+        },
     )
     try:
         path, index_path = eval_logic.persist_result(payload, RESULTS_DIR)
