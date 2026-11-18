@@ -5,19 +5,37 @@
 """
 import numpy as np
 
-# 与 baseline.c / prompt 保持一致的确定性初始化
-def init_matrices(N):
+# float32 机器精度（用于按尺寸校准比较容差）
+EPS32 = float(np.finfo(np.float32).eps)  # ≈1.19e-7
+
+
+# 与 baseline.c / prompt 保持一致的确定性初始化（float64：0~9 整数精确可表示）
+def init_matrices_float64(N):
     i = np.arange(N, dtype=np.int64)
     j = np.arange(N, dtype=np.int64)
-    A = ((i[:, None] + j[None, :]) % 10).astype(np.float32) * np.float32(0.1)
-    B = ((i[:, None] * 3 + j[None, :]) % 10).astype(np.float32) * np.float32(0.1)
+    A = ((i[:, None] + j[None, :]) % 10).astype(np.float64) * 0.1
+    B = ((i[:, None] * 3 + j[None, :]) % 10).astype(np.float64) * 0.1
     return A, B
 
 
 def reference_matmul(N):
-    """numpy 计算的 float32 参考结果（async_eval 无 C 基准时作为基准）。"""
-    A, B = init_matrices(N)
+    """float64 参考结果（async_eval 无 C 基准时作为基准）。
+
+    用 float64 计算参考，避免 numpy float32 参考自身的舍入误差叠加到判据上
+    （B5：2048 时 float32 参考 + 固定 1e-5 会把正确内核误判为错误）。
+    """
+    A, B = init_matrices_float64(N)
     return A @ B
+
+
+def default_tolerance(N):
+    """按尺寸校准的比较容差 (rtol, atol)。
+
+    float32 顺序累加舍入误差近似随 N 线性增长（gamma_N ≈ N*eps32），固定 1e-5
+    在 2048 会把正确内核误判为错误。这里 rtol 随 N 线性放大，atol 只兜底零附近。
+    """
+    rtol = max(1e-6, 2.0 * N * EPS32)
+    return rtol, 1e-6
 
 
 def load_matrix(path, N):

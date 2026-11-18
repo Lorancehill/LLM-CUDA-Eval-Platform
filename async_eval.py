@@ -1,44 +1,36 @@
 import asyncio
-import json
 import os
 import re
+import shlex
 import subprocess
+import uuid
+from datetime import datetime, timezone
+
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
 import validate
 import profiler
+import roofline
+import eval_logic
 
 load_dotenv()
 
 client = AsyncOpenAI(
-    api_key = os.getenv("DEEPSEEK_API_KEY"), 
-    base_url = "https://api.deepseek.com" 
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com",
 )
 
-#限制同时最多只有一个任务传占用GPU   
+# 限制同时最多 1 个任务占用 GPU
 gpu_sem = asyncio.Semaphore(1)
-
-def parse_time_seconds(stdout_str):
-    """从 CUDA 输出解析 'Time: xxx seconds' 中的秒数；无匹配返回 None。"""
-    m = re.search(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)", stdout_str)
-    return float(m.group(1)) if m else None
-
-
-def should_update_best(best_ok, best_time, new_time):
-    """best-so-far 更新判据（纯函数，便于单测）。
-
-    - 尚无正确结果（best_ok=False）：无条件记录为 best（首个正确结果）。
-    - 已有正确结果：仅当新旧耗时都可测量且新耗时严格更小才替换；
-      否则（任一耗时缺失，无法证明更快）保留旧 best，避免被改坏的内核「反杀」。
-    """
-    if not best_ok:
-        return True
-    return best_time is not None and new_time is not None and new_time < best_time
 
 # Docker 沙箱运行超时上限（秒）
 TIMEOUT_SECONDS = 20
 # ncu 画像超时上限（秒）：ncu 需多次 replay kernel 采集全部指标，比普通运行慢得多
 NCU_TIMEOUT_SECONDS = 120
+# API 调用超时 / 重试次数（B6：一次 API 抖动不应毁掉整批）
+API_TIMEOUT_SECONDS = 60
+API_RETRIES = 3
 
 # 沙箱镜像：必须支持 Blackwell (sm_120)，即 CUDA >= 12.8。
 # 12.0.x 不支持 RTX 5060 的 compute_120，编译出的内核无法在该 GPU 上运行。
@@ -51,6 +43,28 @@ PULL_RETRIES = 3
 
 # 画像/分类/反馈证据链落盘目录（运行时产物，已在 .gitignore 忽略）
 RESULTS_DIR = "results"
+
+# 配置的 API 模型别名；真实服务模型以 response.model 为准，逐轮落盘
+MODEL_NAME = "deepseek-chat"
+PROMPT_VERSION = "matmul_v1"
+
+# 目标内核名 demangled 正则（模型生成的 matmul 内核常见命名）。
+# 多 kernel 代码里用 --kernel-name 过滤，避免误采 init/融合算子等第一个 launch。
+MATMUL_KERNEL_REGEX = r"(matmul|matMul|matrixMul|mat_mul|matrix_mul|sgemm|gemm)"
+
+
+def build_prompt(matrix_size):
+    return (
+        f"请用C++和CUDA写一个 {matrix_size}*{matrix_size} 的矩阵乘法代码。要求：\n"
+        "1. 矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f；\n"
+        "2. 用 wall-clock 测量 kernel 执行耗时（用 std::chrono::high_resolution_clock 或 CUDA event，"
+        "在 kernel 启动前后各调一次 cudaDeviceSynchronize；不要用 clock()，它测的是 CPU 时间），"
+        "并打印出 'Time: xxx seconds'；\n"
+        "3. 打印 'C[0][0] = xxx' 用于结果校验；\n"
+        f"4. 将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output_{matrix_size}.bin'："
+        f"fopen('cuda_output_{matrix_size}.bin','wb') 后 fwrite(C, sizeof(float), {matrix_size}*{matrix_size}, fp)。\n"
+        "不要任何废话，只要代码。"
+    )
 
 
 async def _docker_run(cmd, container_name, timeout=TIMEOUT_SECONDS):
@@ -77,6 +91,51 @@ async def _docker_run(cmd, container_name, timeout=TIMEOUT_SECONDS):
         except Exception:
             pass
         return None, (e.stdout or b""), (e.stderr or b""), True
+
+
+async def _run_host(cmd_list, timeout):
+    """宿主侧子进程（ncu 等）。返回 (returncode, stdout_bytes, stderr_bytes, timed_out)。"""
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd_list, capture_output=True, timeout=timeout
+        )
+        return proc.returncode, proc.stdout, proc.stderr, False
+    except subprocess.TimeoutExpired as e:
+        return None, (e.stdout or b""), (e.stderr or b""), True
+
+
+def _usage_dict(usage):
+    """把 OpenAI usage 对象转成可落盘的 dict（缺失/异常返回 None）。"""
+    if usage is None:
+        return None
+    try:
+        return {
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }
+    except Exception:
+        return None
+
+
+async def _chat_completion(messages):
+    """带超时/退避重试的 API 调用。返回 (response, usage_dict, error)。
+
+    response 为 None 表示 API_RETRIES 次均失败（error 为最后一次异常）。
+    """
+    last_err = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL_NAME, messages=messages, timeout=API_TIMEOUT_SECONDS
+            )
+            return response, _usage_dict(getattr(response, "usage", None)), None
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ API 调用失败（第 {attempt}/{API_RETRIES} 次）：{e}")
+            if attempt < API_RETRIES:
+                await asyncio.sleep(2 ** (attempt - 1))  # 1, 2, 4s 退避
+    return None, None, last_err
 
 
 async def ensure_image():
@@ -126,85 +185,115 @@ async def ensure_image():
     return False
 
 
-async def _profile_kernel(matrix_size, container_name, binary, kernel_name=None):
-    """在沙箱内用 ncu 抓取硬件画像；失败/无指标返回 None（不影响主流程）。
+def probe_host_ncu():
+    """探测宿主 ncu 是否可用且认识 gb206，返回 (ok, message)。"""
+    try:
+        r = subprocess.run(["ncu", "--version"], capture_output=True, timeout=15, text=True)
+    except FileNotFoundError:
+        return False, "宿主未安装 ncu（PATH 中无 ncu）"
+    except Exception as e:
+        return False, f"ncu 探测异常：{e}"
+    if r.returncode != 0:
+        return False, f"ncu 无法执行：{(r.stderr or r.stdout).strip()[-120:]}"
+    try:
+        chips = subprocess.run(["ncu", "--list-chips"], capture_output=True, timeout=15, text=True)
+    except Exception as e:
+        return False, f"ncu --list-chips 异常：{e}"
+    chip_txt = (chips.stdout or "") + (chips.stderr or "")
+    if "gb206" in chip_txt.lower():
+        return True, "ncu 可用且认识 gb206"
+    return False, "ncu 已安装但不认识 gb206（--list-chips 无 gb206，需升级）"
 
-    binary 为本次 attempt 独立编译出的可执行文件名；kernel_name 用于多 kernel
-    代码时只 profile 目标内核（避免 init/融合算子等被误采为第一个 kernel）。
+
+def collect_env_snapshot():
+    """收集环境快照（GPU/驱动/ncu/镜像/依赖版本），供论文复现；任一步失败只记 unavailable。"""
+    import platform
+
+    snap = {"python": platform.python_version()}
+    try:
+        import numpy
+        snap["numpy"] = numpy.__version__
+    except Exception:
+        snap["numpy"] = "unavailable"
+    try:
+        import openai as _oai
+        snap["openai"] = getattr(_oai, "__version__", "unknown")
+    except Exception:
+        snap["openai"] = "unavailable"
+
+    def _run(args, timeout=10):
+        try:
+            r = subprocess.run(args, capture_output=True, timeout=timeout, text=True)
+            return (r.stdout or r.stderr or "").strip()
+        except Exception as e:
+            return f"unavailable: {e}"
+
+    snap["gpu"] = _run(
+        ["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"]
+    ) or "unavailable"
+    ncu_ver = _run(["ncu", "--version"])
+    snap["ncu_version"] = ncu_ver.splitlines()[0] if ncu_ver else "unavailable"
+    snap["cuda_image"] = _run(
+        ["docker", "image", "inspect", CUDA_IMAGE, "--format", "{{.Id}}"]
+    ) or "unavailable"
+    return snap
+
+
+async def _profile_kernel(matrix_size, binary, kernel_name=None):
+    """在宿主侧（WSL2）用 ncu profile 容器编译出的二进制；失败/无指标返回 None。
+
+    依赖用户已：① Windows 开 GPU 性能计数器 ② WSL 装支持 GB206 的 ncu。
+    注意：容器编译出的二进制在宿主运行需宿主有对应 CUDA runtime（libcudart）；
+    若缺失，ncu 会加载失败，此处优雅降级（上层回落到 roofline proxy）。
     """
-    cmd = (
-        f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none "
-        f"-v $(pwd):/app --gpus all {CUDA_IMAGE} "
-        f"bash -c 'cd /app && {profiler.build_ncu_cmd(binary, kernel_name)}'"
-    )
-
-    # ncu 画像也占用 GPU，串行执行
+    cmd_list = shlex.split(profiler.build_ncu_cmd(binary, kernel_name))
     async with gpu_sem:
         try:
-            _, stdout, stderr, _ = await _docker_run(
-                cmd, container_name, timeout=NCU_TIMEOUT_SECONDS
-            )
+            _, stdout, stderr, timed_out = await _run_host(cmd_list, NCU_TIMEOUT_SECONDS)
         except Exception as e:
-            print(f"[{matrix_size}] ⚠️ ncu 画像失败（Docker 异常）: {e}")
+            print(f"[{matrix_size}] ⚠️ ncu 画像失败（宿主异常）: {e}")
             return None
 
     stdout_str = stdout.decode(errors="replace")
     stderr_str = stderr.decode(errors="replace")
     metrics = profiler.parse_ncu_csv(stdout_str)
     if not metrics:
-        # 抓不到指标：ncu 失败 / 芯片不支持 / 未安装，降级为无画像，不影响评测
         tail = (stderr_str or stdout_str).strip()[-200:]
-        print(f"[{matrix_size}] ⚠️ ncu 未抓到硬件指标，跳过画像。{tail}")
+        print(f"[{matrix_size}] ⚠️ ncu 未抓到硬件指标，跳过画像（降级 roofline proxy）。{tail}")
         return None
     return metrics
 
 
-def _persist_result(matrix_size, best, records):
-    """把每轮画像指标/分类/反馈与 best-so-far 落盘，便于事后回溯「瓶颈→策略→收益」证据链。
-
-    落盘失败（磁盘满/权限）只告警，不阻断评测主流程。
-    """
-    def _clean_max_diff(v):
-        # NaN -> None，避免写出非法 JSON（json.dump 默认会写成 NaN）
-        return None if (v is not None and v != v) else v
-
-    payload = {
-        "matrix_size": matrix_size,
-        "success": bool(best["ok"]),
-        "best": {
-            "attempt": best["attempt"],
-            "cu_filename": best["cu_filename"],
-            "binary": best["binary"],
-            "effective_time": best["effective_time"],
-            "self_reported_time": best["self_reported_time"],
-            "ncu_time_sec": best["ncu_time_sec"],
-            "max_diff": _clean_max_diff(best["max_diff"]),
-            "bottleneck": best["bottleneck"],
-            "metrics": best["metrics"],
-            "feedback": best["feedback"],
-        },
-        "attempts": [
-            {**r, "max_diff": _clean_max_diff(r["max_diff"])}
-            for r in records
-        ],
+def _empty_record(out_bin):
+    return {
+        "attempt": None,
+        "ok": False,
+        "time_sec": None,
+        "ncu_time_sec": None,
+        "profile_source": None,
+        "max_diff": None,
+        "cu_filename": None,
+        "binary": None,
+        "out_bin": out_bin,
+        "bottleneck": None,
+        "metrics": None,
+        "feedback": None,
+        "code": None,
+        "error_feedback": None,
+        "compile_stdout_tail": None,
+        "compile_stderr_tail": None,
+        "timed_out": None,
+        "returncode": None,
+        "model": None,
+        "usage": None,
     }
-    try:
-        os.makedirs(RESULTS_DIR, exist_ok=True)
-        path = os.path.join(RESULTS_DIR, f"{matrix_size}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        print(f"[{matrix_size}] 📁 画像/分类/反馈证据链已落盘：{path}")
-    except Exception as e:
-        print(f"[{matrix_size}] ⚠️ 结果落盘失败（不影响评测）：{e}")
 
 
-async def evaluate_matrix(matrix_size):
-    messages = [
-        {"role": "user", "content": f"请用C++和CUDA写一个 {matrix_size}*{matrix_size} 的矩阵乘法代码。要求：\n1. 矩阵类型用 float（32位浮点），初始化 A[i][j] = ((i+j)%10)*0.1f，B[i][j] = ((i*3+j)%10)*0.1f；\n2. 用 wall-clock 测量 kernel 执行耗时（用 std::chrono::high_resolution_clock 或 CUDA event，在 kernel 启动前后各调一次 cudaDeviceSynchronize；不要用 clock()，它测的是 CPU 时间），并打印出 'Time: xxx seconds'；\n3. 打印 'C[0][0] = xxx' 用于结果校验；\n4. 将结果矩阵 C（先 cudaMemcpy 从 device 拷回 host）以二进制写入文件 'cuda_output_{matrix_size}.bin'：fopen('cuda_output_{matrix_size}.bin','wb') 后 fwrite(C, sizeof(float), {matrix_size}*{matrix_size}, fp)。\n不要任何废话，只要代码。"}
-    ]
+async def evaluate_matrix(matrix_size, run_id, env_snapshot):
+    messages = [{"role": "user", "content": build_prompt(matrix_size)}]
     max_retries = 3
 
-    # 参考结果（确定性初始化，numpy float32 计算一次）
+    # 参考结果（float64，见 validate.reference_matmul）
     ref = validate.reference_matmul(matrix_size)
     out_bin = f"cuda_output_{matrix_size}.bin"
 
@@ -223,6 +312,7 @@ async def evaluate_matrix(matrix_size):
         "ncu_time_sec": None,
         "max_diff": None,
         "bottleneck": None,
+        "profile_source": None,
         "metrics": None,
         "feedback": None,
     }
@@ -233,17 +323,25 @@ async def evaluate_matrix(matrix_size):
         print(f"\n[{matrix_size}] ==========================================")
         print(f"[{matrix_size}] 🚀 开始第 {attempt + 1} 次生成与评测...")
 
-        response = await client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages
-        )
-        raw_text = response.choices[0].message.content
+        response, usage, api_err = await _chat_completion(messages)
+        if response is None:
+            record = _empty_record(out_bin)
+            record.update({
+                "attempt": attempt + 1,
+                "error_feedback": f"API 调用失败（{api_err}）",
+            })
+            records.append(record)
+            print(f"[{matrix_size}] ❌ 第 {attempt + 1} 次 API 调用失败，跳过本轮。")
+            continue
 
-        #正则清洗
+        raw_text = response.choices[0].message.content or ""
+        model = getattr(response, "model", MODEL_NAME)
+
+        # 正则清洗
         pattern = r'```(?:cpp|c\+\+|c)?\s*(.*?)\s*```'
         match = re.search(pattern, raw_text, re.DOTALL)
         pure_code = match.group(1) if match else raw_text
-            
+
         # 每轮用独立文件名（attempt 后缀）：避免同名覆盖前面正确且更快的内核源码/二进制
         cu_filename = f"matrix_mul_{matrix_size}_attempt{attempt + 1}.cu"
         binary = f"test_{matrix_size}_attempt{attempt + 1}"
@@ -258,8 +356,12 @@ async def evaluate_matrix(matrix_size):
 
         # 这里加了 --rm 自动清理容器，并执行编译和运行
         container_name = f"test_{matrix_size}_attempt{attempt + 1}"
-        cmd = f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none -v $(pwd):/app --gpus all {CUDA_IMAGE} bash -c 'cd /app && nvcc -arch=sm_120 {cu_filename} -o {binary} && ./{binary}'"
-        
+        cmd = (
+            f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none "
+            f"-v $(pwd):/app --gpus all {CUDA_IMAGE} "
+            f"bash -c 'cd /app && nvcc -arch=sm_120 {cu_filename} -o {binary} && ./{binary}'"
+        )
+
         # 异步执行外部命令（GPU 串行，API 并发）
         async with gpu_sem:
             try:
@@ -273,32 +375,34 @@ async def evaluate_matrix(matrix_size):
         stderr_str = stderr.decode(errors="replace")
 
         # 记录本次 attempt 的内核耗时（秒）；无 'Time:' 输出记 None
-        time_sec = parse_time_seconds(stdout_str)
+        time_sec = eval_logic.parse_time_seconds(stdout_str)
         timings.append(time_sec)
 
-        # 读取 CUDA 输出矩阵，与 numpy 参考做 1e-5 容差校验
+        # 读取 CUDA 输出矩阵，与 numpy 参考做按尺寸校准的容差校验
         ok = False
         max_diff = None
         if os.path.exists(out_bin):
             try:
                 got = validate.load_matrix(out_bin, matrix_size)
-                ok, max_diff = validate.matrices_close(ref, got, rtol=1e-5, atol=1e-5)
+                rtol, atol = validate.default_tolerance(matrix_size)
+                ok, max_diff = validate.matrices_close(ref, got, rtol=rtol, atol=atol)
             except ValueError as e:
                 print(f"[{matrix_size}] ⚠️ 矩阵读取/校验异常: {e}")
 
-        record = {
+        record = _empty_record(out_bin)
+        record.update({
             "attempt": attempt + 1,
             "ok": ok,
             "time_sec": time_sec,
-            "ncu_time_sec": None,
             "max_diff": max_diff,
             "cu_filename": cu_filename,
             "binary": binary,
-            "out_bin": out_bin,
-            "bottleneck": None,
-            "metrics": None,
-            "feedback": None,
-        }
+            "code": pure_code,
+            "timed_out": timed_out,
+            "returncode": returncode,
+            "model": model,
+            "usage": usage,
+        })
 
         if not ok:
             print(f"[{matrix_size}] ❌ 第 {attempt + 1} 次评测失败！正在反馈给 AI...")
@@ -307,6 +411,8 @@ async def evaluate_matrix(matrix_size):
             # 真正的自我纠错：把报错信息截取最后 300 个字符存进变量，喂回 DeepSeek
             err_tail = stderr_str[-300:].strip()
             out_tail = stdout_str[-300:].strip()
+            record["compile_stdout_tail"] = out_tail
+            record["compile_stderr_tail"] = err_tail
 
             if timed_out:
                 error_feedback = (
@@ -332,70 +438,99 @@ async def evaluate_matrix(matrix_size):
             else:
                 error_feedback = (
                     f"你上次写的代码能运行，但结果矩阵与基准不符（最大绝对误差 {max_diff:.6g}，"
-                    f"超过 1e-5 容差）。\n请检查矩阵乘法逻辑（索引、累加、边界），修复后重新提供完整的 CUDA 代码。"
+                    f"超过校准容差）。\n请检查矩阵乘法逻辑（索引、累加、边界），修复后重新提供完整的 CUDA 代码。"
                 )
+            record["error_feedback"] = error_feedback
             messages.append({"role": "user", "content": error_feedback})
             records.append(record)
             continue
+
+        print(f"[{matrix_size}] 🎉 第 {attempt + 1} 次评测成功！结果与基准一致（max diff {max_diff:.3g}）。")
+        for line in stdout_str.split('\n'):
+            if "Time:" in line or "耗时" in line:
+                print(f"[{matrix_size}] --- 跑分: {line.strip()}")
+
+        # 结果正确后画像：优先宿主 ncu，失败降级 roofline proxy（counter-free）
+        profile = await _profile_kernel(matrix_size, binary, MATMUL_KERNEL_REGEX)
+        label = None
+        feedback = None
+        ncu_time_sec = None
+        source = None
+        metrics = None
+        if profile is not None:
+            source = "ncu"
+            metrics = profile
+            print(f"[{matrix_size}] 📊 ncu 硬件画像：\n{profiler.format_metrics(profile)}")
+            label, feedback = profiler.classify_bottleneck(profile)
+            if profile.get("gpu__time_duration.sum") is not None:
+                ncu_time_sec = profile["gpu__time_duration.sum"] / 1e9
+                print(f"[{matrix_size}] ⏱️  ncu 可信计时 {ncu_time_sec:.6f}s（自报 {time_sec if time_sec is not None else 'N/A'}s）")
         else:
-            print(f"[{matrix_size}] 🎉 第 {attempt + 1} 次评测成功！结果与基准一致（max diff {max_diff:.3g}）。")
-            for line in stdout_str.split('\n'):
-                if "Time:" in line or "耗时" in line:
-                    print(f"[{matrix_size}] --- 跑分: {line.strip()}")
+            # 降级：roofline proxy（不依赖 ncu，今天即可端到端跑通）
+            source = "roofline_proxy"
+            label, feedback, metrics = roofline.roofline_classify(matrix_size, time_sec, pure_code)
+            print(f"[{matrix_size}] 📊 roofline 指纹（counter-free）：{roofline.format_proxy_metrics(metrics)}")
+        if label not in (None, "unknown"):
+            print(f"[{matrix_size}] 🧭 瓶颈分类: {label}（{source}）")
 
-            # 结果正确后，用 Nsight Compute 抓取硬件画像，从「只看耗时」升级为「瓶颈分类」
-            profile = await _profile_kernel(matrix_size, f"{container_name}_ncu", binary)
-            label = None
-            feedback = None
-            ncu_time_sec = None
-            if profile is not None:
-                print(f"[{matrix_size}] 📊 硬件画像：\n{profiler.format_metrics(profile)}")
-                label, feedback = profiler.classify_bottleneck(profile)
-                print(f"[{matrix_size}] 🧭 瓶颈分类: {label}")
-                # ncu 的 gpu__time_duration.sum 是可信内核计时，优先用它替代模型自报的 Time:
-                if profile.get("gpu__time_duration.sum") is not None:
-                    ncu_time_sec = profile["gpu__time_duration.sum"] / 1e9
-                    print(f"[{matrix_size}] ⏱️  ncu 可信计时 {ncu_time_sec:.6f}s（自报 {time_sec if time_sec is not None else 'N/A'}s）")
-            record["ncu_time_sec"] = ncu_time_sec
-            record["bottleneck"] = label
-            record["metrics"] = profile
-            record["feedback"] = feedback
+        record["ncu_time_sec"] = ncu_time_sec
+        record["profile_source"] = source
+        record["bottleneck"] = label
+        record["metrics"] = metrics
+        record["feedback"] = feedback
 
-            # best-so-far 更新：仅当「正确且更快」才更新（更快优先用 ncu 可信计时）
-            effective_time = ncu_time_sec if ncu_time_sec is not None else time_sec
-            if should_update_best(best["ok"], best["effective_time"], effective_time):
-                best.update({
-                    "ok": True,
-                    "attempt": attempt + 1,
-                    "cu_filename": cu_filename,
-                    "binary": binary,
-                    "effective_time": effective_time,
-                    "self_reported_time": time_sec,
-                    "ncu_time_sec": ncu_time_sec,
-                    "max_diff": max_diff,
-                    "bottleneck": label,
-                    "metrics": profile,
-                    "feedback": feedback,
-                })
-                if best["effective_time"] is not None:
-                    print(f"[{matrix_size}] ✅ 更新最优：attempt {attempt + 1}，耗时 {best['effective_time']:.6f}s")
-                else:
-                    print(f"[{matrix_size}] ✅ 记录首个正确结果：attempt {attempt + 1}")
+        # best-so-far 更新：仅当「正确且更快」才更新（更快优先用 ncu 可信计时）
+        effective_time = ncu_time_sec if ncu_time_sec is not None else time_sec
+        if eval_logic.should_update_best(best["ok"], best["effective_time"], effective_time):
+            best.update({
+                "ok": True,
+                "attempt": attempt + 1,
+                "cu_filename": cu_filename,
+                "binary": binary,
+                "effective_time": effective_time,
+                "self_reported_time": time_sec,
+                "ncu_time_sec": ncu_time_sec,
+                "max_diff": max_diff,
+                "bottleneck": label,
+                "profile_source": source,
+                "metrics": metrics,
+                "feedback": feedback,
+            })
+            if best["effective_time"] is not None:
+                print(f"[{matrix_size}] ✅ 更新最优：attempt {attempt + 1}，耗时 {best['effective_time']:.6f}s")
+            else:
+                print(f"[{matrix_size}] ✅ 记录首个正确结果：attempt {attempt + 1}")
 
-            records.append(record)
+        records.append(record)
 
-            # 瓶颈识别 → 策略选择 → 自动迭代：memory/compute/latency 三类瓶颈都要接策略继续优化
-            if label in ("memory", "compute", "latency") and attempt + 1 < max_retries:
-                messages.append({"role": "assistant", "content": raw_text})
-                messages.append({"role": "user", "content": feedback})
-                print(f"[{matrix_size}] 🔄 检测到 {label} 瓶颈，已反馈给 AI 继续优化...")
-                continue
+        # 瓶颈识别 → 策略选择 → 自动迭代：memory/compute/latency 三类瓶颈都要接策略继续优化
+        if label in ("memory", "compute", "latency") and attempt + 1 < max_retries:
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({"role": "user", "content": feedback})
+            print(f"[{matrix_size}] 🔄 检测到 {label} 瓶颈，已反馈给 AI 继续优化...")
+            continue
 
-            # 无瓶颈（unknown / 画像缺失）→ 没有有效策略可反馈，停止迭代
-            break
+        # 无瓶颈（unknown / 画像缺失）→ 没有有效策略可反馈，停止迭代
+        break
 
     # 循环结束：只要有 best 就返回成功；后续 attempt 失败不会「反杀」已找到的最优
-    _persist_result(matrix_size, best, records)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    payload = eval_logic.build_result_payload(
+        run_id=run_id,
+        timestamp=timestamp,
+        matrix_size=matrix_size,
+        model_name=MODEL_NAME,
+        prompt_version=PROMPT_VERSION,
+        best=best,
+        records=records,
+        env_snapshot=env_snapshot,
+    )
+    try:
+        path, index_path = eval_logic.persist_result(payload, RESULTS_DIR)
+        print(f"[{matrix_size}] 📁 证据链已落盘：{path}（索引 {index_path}）")
+    except Exception as e:
+        print(f"[{matrix_size}] ⚠️ 结果落盘失败（不影响评测）：{e}")
+
     if best["ok"]:
         if best["effective_time"] is not None:
             print(f"[{matrix_size}] ✅ 完成：最优 attempt {best['attempt']}，耗时 {best['effective_time']:.6f}s")
@@ -405,28 +540,47 @@ async def evaluate_matrix(matrix_size):
     print(f"[{matrix_size}] 🚨 达到最大重试次数，失败。")
     return False, timings
 
+
 async def main():
     # 我们同时测试 3 种不同的矩阵大小
     sizes = [256, 512, 1024]
-    
+
     print("================ 开始并发评测 ================")
     if not await ensure_image():
         print("================ 沙箱镜像不可用，评测中止 ================")
         return
-    # 使用 asyncio.gather 让这 3 个任务同时起飞
-    tasks = [evaluate_matrix(size) for size in sizes]
-    results = await asyncio.gather(*tasks)
-    for size, (ok, _timings) in zip(sizes, results):
-        print(f"[汇总] 尺寸 {size}: {'✅成功' if ok else '❌失败'}")
+
+    ncu_ok, ncu_msg = probe_host_ncu()
+    print(f"[ncu] 宿主探测：{ncu_msg}")
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    env_snapshot = collect_env_snapshot()
+    print(f"[run] run_id={run_id}")
+
+    # 使用 asyncio.gather 让这 3 个任务同时起飞；return_exceptions 保证单尺寸异常不毁掉整批
+    tasks = [evaluate_matrix(size, run_id, env_snapshot) for size in sizes]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for size, res in zip(sizes, results):
+        if isinstance(res, Exception):
+            print(f"[汇总] 尺寸 {size}: ❌异常 {res!r}")
+        else:
+            ok, _timings = res
+            print(f"[汇总] 尺寸 {size}: {'✅成功' if ok else '❌失败'}")
 
     # 打印每个尺寸各次 attempt 的内核耗时列表（单位：秒），供画性能演进图
     def fmt(t):
         return "None" if t is None else f"{t:.6f}"
+
     print("\n================ 性能演进（每次 attempt 耗时，单位：秒） ================")
-    for size, (_ok, timings) in zip(sizes, results):
+    for size, res in zip(sizes, results):
+        if isinstance(res, Exception):
+            print(f"[{size}] [异常]")
+            continue
+        _ok, timings = res
         print(f"[{size}] [{', '.join(fmt(t) for t in timings)}]")
     print("======================================================================")
     print("================ 评测全部结束 ================")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

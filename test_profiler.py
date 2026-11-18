@@ -34,17 +34,22 @@ def test_build_ncu_cmd():
     cmd = profiler.build_ncu_cmd("test_1024")
     assert "ncu --csv" in cmd
     assert "--launch-count 1" in cmd
+    assert "--clock-control none" in cmd
+    assert "--target-processes all" in cmd
     assert "./test_1024" in cmd
     for m in profiler.METRICS:
         assert m in cmd, f"指标 {m} 应出现在命令中"
 
 
 def test_build_ncu_cmd_kernel_name_filter():
-    cmd = profiler.build_ncu_cmd("test_1024", kernel_name="matmul")
-    assert "--kernel-name matmul" in cmd
+    cmd = profiler.build_ncu_cmd("test_1024", kernel_name=r"matmul|matrixMul")
+    assert "--kernel-name-base demangled" in cmd
+    assert "--kernel-name regex:matmul|matrixMul" in cmd
     assert "./test_1024" in cmd
-    # 不传 kernel_name 时保持「第一个 kernel launch」默认行为
-    assert "--kernel-name" not in profiler.build_ncu_cmd("test_1024")
+    # 不传 kernel_name 时保持「第一个 kernel launch」默认行为，不带 kernel 过滤
+    no_kernel = profiler.build_ncu_cmd("test_1024")
+    assert "--kernel-name" not in no_kernel
+    assert "--kernel-name-base" not in no_kernel
 
 
 def test_parse_ncu_csv_ignores_app_noise():

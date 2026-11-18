@@ -1,0 +1,89 @@
+"""eval_logic.py 的离线单测：耗时解析、best-so-far 判据、落盘 schema v2。"""
+
+import json
+import os
+import shutil
+import tempfile
+
+import eval_logic
+
+
+def test_parse_time_seconds():
+    assert eval_logic.parse_time_seconds("Time: 0.123456 seconds") == 0.123456
+    assert eval_logic.parse_time_seconds("Time: 1.5e-3 seconds") == 1.5e-3
+    assert eval_logic.parse_time_seconds("no time here") is None
+
+
+def test_should_update_best_boundary():
+    # 首次正确：无条件记录
+    assert eval_logic.should_update_best(False, None, None) is True
+    assert eval_logic.should_update_best(False, None, 0.5) is True
+    # 更快 → 更新
+    assert eval_logic.should_update_best(True, 0.5, 0.3) is True
+    # 更慢 → 保留
+    assert eval_logic.should_update_best(True, 0.5, 0.7) is False
+    # 相等 → 保留
+    assert eval_logic.should_update_best(True, 0.5, 0.5) is False
+    # 旧缺失、新存在 → 更新（B6 修复）
+    assert eval_logic.should_update_best(True, None, 0.3) is True
+    # 旧存在、新缺失 → 保留
+    assert eval_logic.should_update_best(True, 0.5, None) is False
+    # 两者缺失 → 保留
+    assert eval_logic.should_update_best(True, None, None) is False
+
+
+def test_sanitize_float():
+    assert eval_logic.sanitize_float(float("nan")) is None
+    assert eval_logic.sanitize_float(1.5) == 1.5
+    assert eval_logic.sanitize_float(None) is None
+
+
+def test_persist_result_writes_json_and_index():
+    tmp = tempfile.mkdtemp()
+    try:
+        payload = eval_logic.build_result_payload(
+            run_id="run-1",
+            timestamp="2026-11-18T00:00:00Z",
+            matrix_size=256,
+            model_name="deepseek-chat",
+            prompt_version="matmul_v1",
+            best={
+                "ok": True, "attempt": 2, "cu_filename": "a.cu", "binary": "b",
+                "effective_time": 0.3, "self_reported_time": 0.31, "ncu_time_sec": 0.3,
+                "max_diff": float("nan"), "bottleneck": "memory", "profile_source": "ncu",
+                "metrics": {"gpu__time_duration.sum": 3e8}, "feedback": "x",
+            },
+            records=[{
+                "attempt": 1, "ok": False, "time_sec": None, "ncu_time_sec": None,
+                "profile_source": None, "max_diff": None, "cu_filename": None, "binary": None,
+                "out_bin": "o.bin", "bottleneck": None, "metrics": None, "feedback": None,
+                "code": None, "error_feedback": "boom", "compile_stdout_tail": None,
+                "compile_stderr_tail": None, "timed_out": False, "returncode": 1,
+                "model": "deepseek-flash", "usage": {"prompt_tokens": 10},
+            }],
+            env_snapshot={"python": "3.14"},
+        )
+        path, index_path = eval_logic.persist_result(payload, tmp)
+        assert os.path.exists(path)
+        with open(path) as f:
+            data = json.load(f)
+        assert data["run_id"] == "run-1"
+        assert data["best"]["max_diff"] is None  # NaN -> None
+        assert data["attempts"][0]["error_feedback"] == "boom"
+        assert data["attempts"][0]["model"] == "deepseek-flash"
+        assert os.path.exists(index_path)
+        with open(index_path) as f:
+            lines = f.read().strip().splitlines()
+        assert len(lines) == 1
+        summary = json.loads(lines[0])
+        assert summary["run_id"] == "run-1" and summary["success"] is True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        fn()
+        print(f"PASS {fn.__name__}")
+    print(f"\n{len(fns)} tests passed.")

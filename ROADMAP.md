@@ -28,19 +28,24 @@
    · 动作：大模型写代码前，先根据需求检索相关“最佳实践”文档，作为 Context 喂给它。
    · 目的：极大降低大模型的“幻觉”，让它写出带 __shared__ 或 Tiling 的高级优化代码，而不是简单的暴力循环。
 6. 接入 Profiling 性能分析工具 (Nsight Compute)
-   · 完善：学习命令行工具，在沙箱中运行 ncu，抓取底层的显存带宽利用率、L2 Cache 命中率、SM 计算单元占用率。
+   · 完善：学习命令行工具，在宿主侧（WSL2）运行 ncu，抓取底层的显存带宽利用率、L2 Cache 命中率、SM 计算单元占用率。
    · 动作：如果发现“计算单元没吃满，但显存读取很高”，系统自动将“你的代码存在内存瓶颈”作为 Prompt 反馈给 AI。
    · 目的：从“只看总耗时”升级为“基于硬件画像的精准调优”。
-   · ⚠️ 代码完成 + 单测通过，实机验证被三重阻塞（尚未产出真实硬件指标）：
-     profiler.py（ncu 命令构造 / CSV 解析 / 瓶颈分类 memory·compute·latency，三类瓶颈均生成策略反馈）、
-     async_eval.py 成功路径接入画像并落盘「瓶颈→策略→收益」证据链，ncu 失败优雅降级；best-so-far
-     逻辑保证「成功后继续优化失败不会反杀最优内核」。三重阻塞：
-       ① 容器内 ncu 2025.1.1 不认识 GB206：`ncu --list-chips` 只有 gb100/gb10b/gb202/gb203/gb205，无 gb206；
-       ② 容器内实际 profile 失败 `Failed to initialize the profiler: LibraryNotLoaded`——WSL+Docker 组合下
-          ncu 加载不到驱动 profiling 库，非版本问题，换新版本大概率仍如此，ncu 须跑 WSL 宿主侧；
-       ③ 宿主 ncu（2024.1.1）失败 `ERR_NVGPUCTRPERM`——Windows 侧未开 GPU 性能计数器
-          （NVIDIA 控制面板 → Developer → Manage GPU Performance Counters），且 ncu 须装在 WSL 里；
-          宿主 apt 源只有 2024.1.1，升级需从 NVIDIA 官网下载 Nsight Compute 安装包。
+   · ⚠️ 代码完成 + 单测全过 + 循环可端到端跑；真实 ncu 指标仍待用户两步环境操作：
+     - profiler.py：ncu 命令构造（宿主侧，--clock-control none / --target-processes all /
+       --kernel-name-base demangled / --kernel-name 正则）/ CSV 解析 / 瓶颈分类
+       memory·compute·latency（三类均生成策略反馈）。
+     - roofline.py（新增）：counter-free 兜底画像——实测时间 + 算子规格 + 源码特征
+       （__shared__/float4）做 roofline 判据，ncu 不可用时循环仍能产出瓶颈反馈；
+       这是「知识可迁移」研究点（计数器指纹跨卡迁移会断，counter-free 不会）。
+     - async_eval.py：成功路径优先宿主 ncu，失败降级 roofline proxy；best-so-far 保优；
+       API 调用带超时/退避重试，gather 用 return_exceptions 防单尺寸异常毁整批。
+     - eval_logic.py（新增）：results schema v2 落盘（results/{run_id}/{N}.json +
+       index.jsonl，含 run_id/时间戳/response.model 真实名/环境快照/每轮 code 全文与错误反馈）。
+     - validate.py：float64 参考 + 按尺寸校准容差（修复 2048 正确内核被误判）。
+     仍需用户做的两件事（代码代不了）：① Windows 控制面板开 GPU 性能计数器；
+     ② WSL 从 NVIDIA 官网装支持 GB206 的最新 Nsight Compute，装后
+     `ncu --list-chips | grep -i gb206` 应能搜到。
 7. 引入 Auto-tuning (自动参数搜索)
    · 完善：结合简单的暴力搜索或遗传算法。
    · 动作：让大模型生成代码骨架，参数部分（如 block_size, grid_size）留空。系统自动遍历测试不同参数组合，找出最优解。

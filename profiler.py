@@ -1,6 +1,6 @@
 """Nsight Compute (ncu) 硬件性能画像模块。
 
-在 Docker 沙箱内运行 ncu，抓取底层硬件指标并做瓶颈分类：
+在宿主侧（WSL2）直接运行 ncu，profile 容器编译出的二进制，抓取底层硬件指标并做瓶颈分类：
 - 显存(DRAM)带宽利用率
 - L2 Cache 命中率
 - SM 计算单元吞吐率（计算占用率）
@@ -42,23 +42,33 @@ SM_SATURATED_PCT = 60.0  # SM 占用率 >= 60% 视为「计算单元吃满」
 
 
 def build_ncu_cmd(binary: str, kernel_name: str | None = None) -> str:
-    """构造在沙箱内运行的 ncu 命令行（默认只 profile 第一次 kernel launch，输出 CSV）。
+    """构造在宿主侧运行的 ncu 命令行（默认只 profile 第一次 kernel launch，输出 CSV）。
 
-    kernel_name 用于在多 kernel 代码中只 profile 目标内核（否则 --launch-count 1
-    会误采第一个 kernel，如 init kernel / 融合算子）。传内核函数名或正则（ncu 支持
-    ``regex:...`` 前缀）；为 None 时保持「第一个 kernel launch」的默认行为。
+    kernel_name 传入**正则片段**（不含 ``regex:`` 前缀），用于在多 kernel 代码中只
+    profile 目标内核（否则 --launch-count 1 会误采第一个 kernel，如 init kernel /
+    融合算子）；为 None 时保持「第一个 kernel launch」的默认行为。
+
+    宿主侧（WSL2）适配：
+    - ``--clock-control none``：不锁频，避免 WSL 下无权限修改时钟；
+    - ``--target-processes all``：允许注入到全部相关进程；
+    - ``--kernel-name-base demangled``：按 demangled 内核名匹配正则。
     """
+    base = (
+        "ncu --csv --print-metric-name name "
+        "--clock-control none --target-processes all "
+    )
     if kernel_name:
-        # 按内核名过滤，只 profile 命中的第一个 launch
+        # 按内核名（demangled 正则）过滤，只 profile 命中的第一个 launch
         return (
-            "ncu --csv --print-metric-name name "
-            f"--kernel-name {kernel_name} --launch-count 1 --launch-skip 0 "
-            f"--metrics {','.join(METRICS)} ./{binary}"
+            base
+            + f"--kernel-name-base demangled --kernel-name regex:{kernel_name} "
+            + "--launch-count 1 --launch-skip 0 "
+            + f"--metrics {','.join(METRICS)} ./{binary}"
         )
     return (
-        "ncu --csv --print-metric-name name "
-        "--launch-count 1 --launch-skip 0 "
-        f"--metrics {','.join(METRICS)} ./{binary}"
+        base
+        + "--launch-count 1 --launch-skip 0 "
+        + f"--metrics {','.join(METRICS)} ./{binary}"
     )
 
 
