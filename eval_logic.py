@@ -38,6 +38,24 @@ def sanitize_float(v: float | None) -> float | None:
     return None if (v is not None and v != v) else v
 
 
+def compute_speedup(prev_time, cur_time) -> float | None:
+    """加速比 = prev_time / cur_time（>1 更快，<1 更慢，==1 持平）。
+
+    两者都必须是正的有限数才可比较；否则返回 None（无法比较）。
+    用于记录「本轮相对上一成功轮的提速」，与 best-so-far 的绝对保优判据互补。
+    """
+    try:
+        p = float(prev_time)
+        c = float(cur_time)
+    except (TypeError, ValueError):
+        return None
+    if p != p or c != c:   # NaN
+        return None
+    if p <= 0 or c <= 0:
+        return None
+    return p / c
+
+
 def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_version,
                          best, records, env_snapshot, knowledge=None):
     """构造 results schema v2 的落盘 payload（纯函数，不做 I/O）。

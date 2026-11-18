@@ -213,6 +213,55 @@ def test_bottleneck_round_uses_bm25_without_prior():
     assert 0.0 <= hits[0]["score_breakdown"]["bm25_norm"] <= 1.0
 
 
+def test_generalize_shape_rounds_down_pow2():
+    assert rag.generalize_shape({"M": 1024, "batch": 1}) == {"M": ">=512", "batch": ">=1"}
+    assert rag.generalize_shape({"M": 256, "N": 512}) == {"M": ">=128", "N": ">=256"}
+    assert rag.generalize_shape({}) == {}
+
+
+def test_infer_applied_cards_feature_flip():
+    card = make_card("TILING_01")
+    card["transform"]["name"] = "shared_memory_tiling"
+    prev = {"has_shared_mem": False, "has_vectorized_load": False}
+    cur = {"has_shared_mem": True, "has_vectorized_load": False}
+    assert rag.infer_applied_cards(["TILING_01"], prev, cur, [card]) == ["TILING_01"]
+    # 特征未翻转 → 不判 applied
+    assert rag.infer_applied_cards(["TILING_01"], prev, prev, [card]) == []
+
+
+def test_infer_applied_cards_register_tiling_and_unknown():
+    reg = make_card("REG")
+    reg["transform"]["name"] = "register_tiling"
+    db = make_card("DB")
+    db["transform"]["name"] = "double_buffering"
+    both = {"has_shared_mem": True, "has_vectorized_load": True}
+    assert rag.infer_applied_cards(["REG"], {"has_shared_mem": False}, both, [reg]) == ["REG"]
+    assert rag.infer_applied_cards(["REG"], {}, {"has_shared_mem": True, "has_vectorized_load": False}, [reg]) == []
+    # double_buffering 无法从静态特征可靠判断 → 跳过
+    assert rag.infer_applied_cards(["DB"], {}, both, [db]) == []
+
+
+def test_compute_confidence_updates_and_clamp():
+    assert rag.compute_confidence_updates(["A", "B"], True) == {"A": 0.05, "B": 0.05}
+    assert rag.compute_confidence_updates(["A"], False) == {"A": -0.05}
+    assert rag.compute_confidence_updates([], True) == {}
+    assert rag.clamp_confidence(1.2) == 0.95
+    assert rag.clamp_confidence(-0.3) == 0.1
+    assert rag.clamp_confidence(0.5) == 0.5
+
+
+def test_distill_generalizes_shape():
+    rec = {
+        "ok": True, "bottleneck": "memory",
+        "source_features": {"has_shared_mem": True},
+        "speedup": 2.0, "run_id": "20261201-101500-ab12cd",
+        "operator_spec": SPEC,
+    }
+    card = rag.distill_from_run(rec)
+    assert card["semantics"]["shape"] == {"M": ">=512", "N": ">=512", "K": ">=512", "batch": ">=1"}
+    assert card["evidence"][0]["N"] == 1024
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

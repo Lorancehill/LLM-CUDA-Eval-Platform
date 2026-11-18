@@ -44,6 +44,23 @@ STRATEGY_PRIOR = {
 # 近因衰减半衰期（天）：last_validated/created_at 距今这么久后 recency 衰减到 0.5
 RECENCY_HALF_LIFE_DAYS = 180.0
 
+# R3 自蒸馏：每张应用卡的置信度增量与上下限（人工 review 后合并时夹取）
+CONFIDENCE_STEP = 0.05
+CONFIDENCE_MIN = 0.1
+CONFIDENCE_MAX = 0.95
+
+# 归因签名：由「前后两轮源码特征变化」推断模型是否应用了某张检索到的卡。
+# tuple(feature, prev_expected, cur_expected) = 特征从 prev_expected 翻转到 cur_expected；
+# None 表示无法只靠单一特征翻转判断（register_tiling 需 shared+vectorized 同时为 true，
+# double_buffering/split_k 无法从静态特征可靠判断，标记 unknown 跳过）。
+CARD_FEATURE_SIGNATURES = {
+    "shared_memory_tiling": ("has_shared_mem", False, True),
+    "vectorized_load":     ("has_vectorized_load", False, True),
+    "register_tiling":     None,
+    "double_buffering":    None,
+    "split_k":             None,
+}
+
 # Okapi BM25 参数
 BM25_K1 = 1.5
 BM25_B = 0.75
@@ -321,6 +338,83 @@ def build_context_block(hits, max_chars=3000) -> str:
     return block
 
 
+def clamp_confidence(value: float) -> float:
+    """把置信度夹在 [CONFIDENCE_MIN, CONFIDENCE_MAX]。"""
+    return max(CONFIDENCE_MIN, min(CONFIDENCE_MAX, value))
+
+
+def _generalize_dim(value) -> str | None:
+    """把具体维度值泛化为下界约束字符串（候选卡 semantics.shape 用）。
+
+    规则：向下取 2 的幂（floor pow2），再退一档作下界（1024 → '>=512'，256 → '>=128'）。
+    候选卡从单次实验蒸馏而来，写成精确相等（"M": 1024）只会匹配同一尺寸；退一档给出
+    可覆盖相邻尺寸的下限，是否过宽交由人工 review 确认。
+    """
+    if value is None:
+        return None
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    if v <= 1:
+        return ">=1"
+    p = 1
+    while p * 2 <= v:
+        p *= 2
+    return f">={max(1, p // 2)}"
+
+
+def generalize_shape(shape: dict) -> dict:
+    """把 shape 每个维度从具体值泛化为下界约束（供候选卡 semantics.shape）。"""
+    out = {}
+    for k, v in (shape or {}).items():
+        g = _generalize_dim(v)
+        if g is not None:
+            out[k] = g
+    return out
+
+
+def infer_applied_cards(retrieved_ids, prev_feats, cur_feats, cards) -> list[str]:
+    """由前后两轮源码特征变化推断模型实际采用了哪张检索到的卡；无法判断的跳过。
+
+    逐张检索到的卡，按其 transform.name 查 CARD_FEATURE_SIGNATURES：
+    - tuple(feature, prev_expected, cur_expected)：特征从 prev_expected 翻转到 cur_expected 才判 applied；
+    - None 且 name=='register_tiling'：当前 has_shared_mem 与 has_vectorized_load 同时为 True 才判 applied；
+    - None 且其它（double_buffering/split_k/未知）：静态特征无法可靠判断，跳过。
+
+    prev_feats/cur_feats 为 roofline.source_features 输出；缺键按 False 处理。
+    """
+    prev_feats = prev_feats or {}
+    cur_feats = cur_feats or {}
+    by_id = {c.get("id"): c for c in (cards or [])}
+    applied = []
+    for cid in retrieved_ids or []:
+        card = by_id.get(cid)
+        if card is None:
+            continue
+        name = (card.get("transform") or {}).get("name", "")
+        sig = CARD_FEATURE_SIGNATURES.get(name)
+        if sig is None:
+            if name == "register_tiling" and bool(cur_feats.get("has_shared_mem")) \
+                    and bool(cur_feats.get("has_vectorized_load")):
+                applied.append(cid)
+            continue
+        feature, prev_expected, cur_expected = sig
+        if bool(prev_feats.get(feature)) == prev_expected and bool(cur_feats.get(feature)) == cur_expected:
+            applied.append(cid)
+    return applied
+
+
+def compute_confidence_updates(applied_ids, improved: bool) -> dict[str, float]:
+    """每张应用卡本次的置信度增量：improved=True → +0.05，False → -0.05。
+
+    返回「待合并增量」（delta）而非新的绝对置信度；合并时用 clamp_confidence 夹取到
+    [CONFIDENCE_MIN, CONFIDENCE_MAX]。knowledge_updates.json 记录增量，人工 review 后合并。
+    """
+    delta = CONFIDENCE_STEP if improved else -CONFIDENCE_STEP
+    return {cid: delta for cid in (applied_ids or [])}
+
+
 def _candidate_card_id(run_record: dict) -> str:
     rid = str(run_record.get("run_id") or "")
     clean = re.sub(r"[^A-Za-z0-9]", "", rid)
@@ -334,7 +428,7 @@ def distill_from_run(run_record: dict) -> dict | None:
     - ok=True 且 speedup>1 → 返回候选卡 dict（fingerprint 取自本轮瓶颈/源码特征，
       evidence 记录 run_id/speedup，confidence 初值 0.3）。
     - 其余（失败/未更快）→ None。失败/变慢的 failure_modes 更新需对比前后代码的
-      LLM 总结（R3 阶段），此处不做，避免无依据地污染负知识。
+      LLM 总结（R4 阶段），此处不做，避免无依据地污染负知识。
     """
     if not run_record.get("ok"):
         return None
@@ -344,7 +438,8 @@ def distill_from_run(run_record: dict) -> dict | None:
     op = run_record.get("operator_spec") or {}
     bottleneck = run_record.get("bottleneck")
     feats = run_record.get("source_features") or {}
-    shape = op.get("shape") or {}
+    raw_shape = op.get("shape") or {}
+    shape = generalize_shape(raw_shape)
     fingerprint = {}
     if bottleneck:
         fingerprint["bottleneck"] = [bottleneck]
@@ -376,7 +471,7 @@ def distill_from_run(run_record: dict) -> dict | None:
             "run_id": run_record.get("run_id"),
             "source": "self_experiment",
             "speedup": speedup,
-            "N": shape.get("N"),
+            "N": raw_shape.get("N"),
         }],
         "confidence": 0.3,
         "provenance": "自身实验蒸馏（self-distillation）",

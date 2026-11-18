@@ -22,3 +22,6 @@ __pycache__/
 
 # 画像/分类/反馈证据链落盘目录（运行时产物）
 results/
+
+# R3 自蒸馏候选卡（运行时产物，人工 review 后合并进 strategies/）
+knowledge/candidates/

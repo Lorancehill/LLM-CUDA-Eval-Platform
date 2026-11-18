@@ -38,6 +38,18 @@ def test_sanitize_float():
     assert eval_logic.sanitize_float(None) is None
 
 
+def test_compute_speedup():
+    assert eval_logic.compute_speedup(0.5, 0.1) == 5.0
+    assert eval_logic.compute_speedup(0.5, 0.5) == 1.0
+    assert eval_logic.compute_speedup(0.1, 0.5) == 0.2
+    assert eval_logic.compute_speedup(None, 0.5) is None
+    assert eval_logic.compute_speedup(0.5, None) is None
+    assert eval_logic.compute_speedup(0.0, 0.5) is None
+    assert eval_logic.compute_speedup(0.5, 0.0) is None
+    assert eval_logic.compute_speedup(0.5, float("nan")) is None
+    assert eval_logic.compute_speedup("x", 0.5) is None
+
+
 def test_persist_result_writes_json_and_index():
     tmp = tempfile.mkdtemp()
     try:

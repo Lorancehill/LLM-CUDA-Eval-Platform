@@ -1,0 +1,33 @@
+{
+  "id": "OCCUPANCY_01",
+  "version": 1,
+  "status": "curated",
+  "operator_family": ["matmul", "bmm", "gemm"],
+  "semantics": {
+    "shape": {"M": ">=64", "N": ">=64", "K": ">=64", "batch": ">=1"},
+    "dtype": "float32",
+    "tolerance": "default"
+  },
+  "fingerprint": {
+    "bottleneck": ["latency"],
+    "ncu_ranges": {"sm_util": "< 60"}
+  },
+  "transform": {
+    "name": "increase_occupancy",
+    "description": "提高占用率（occupancy）：增大 grid 规模、合理 block_size，让更多 warp 常驻 SM 以隐藏访存延迟；适用于并行度不足、latency 受限的 naive 内核。",
+    "code_hint": "// dim3 block(16,16) or (32,8); dim3 grid((N+block.x-1)/block.x, (N+block.y-1)/block.y);\n// more resident warps hide global-memory latency; avoid serial dependency/branches",
+    "params": {"block_size": [16, 32], "grid_scale": [1, 2]}
+  },
+  "expected_gain": "1.5x-5x（并行度受限场景）",
+  "failure_modes": [
+    "block_size 过大导致每 SM 可常驻 block 数减少，占用率反而下降",
+    "寄存器/共享内存占用过高限制占用率"
+  ],
+  "evidence": [
+    {"source": "CUDA C Best Practices Guide, Ch.10 Execution Configuration Optimizations", "note": "occupancy 隐藏访存延迟"}
+  ],
+  "confidence": 0.5,
+  "provenance": "CUDA C Best Practices Guide, Ch.10 Execution Configuration Optimizations",
+  "created_at": "2026-11-18",
+  "last_validated": null
+}

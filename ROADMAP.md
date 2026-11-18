@@ -28,14 +28,17 @@
    · 动作：大模型写代码前，先根据需求检索相关"最佳实践"文档，作为 Context 喂给它。
    · 目的：极大降低大模型的"幻觉"，让它写出带 __shared__ 或 Tiling 的高级优化代码，而不是简单的暴力循环。
    · ✅ 初步实现（2026-11-18，对应《RAG知识库设计与实施计划》R0/R1/R2）：
-     - knowledge/strategies/*.json：5 张 matmul 策略卡（tiling / split-K / vectorized load /
-       register tiling / double buffering），用 JSON 零新依赖（暂不引 ChromaDB/PyYAML）。
+     - knowledge/strategies/*.json：6 张 matmul 策略卡（tiling / split-K / vectorized load /
+       register tiling / double buffering / occupancy），用 JSON 零新依赖（暂不引 ChromaDB/PyYAML）。
      - rag.py：零依赖 BM25 + 硬过滤（算子族 + 瓶颈指纹 + 语义约束）+ 置信度/近因加权；纯函数离线单测。
      - async_eval.py：首轮 + 画像后两处注入；results 记录 knowledge{enabled,mode,top_k,retrieved_card_ids}；
        KNOWLEDGE_ENABLED 消融开关（默认关）。
-     - test_rag.py：17 项单测全过。
-     待做（R3 自蒸馏 + R4 实验）：失败→failure_modes 更新需 LLM 代码 diff（distill_from_run 成功路径已就位）；
-     Recall@3 标注集与 kb on/off 消融数据尚未建。
+     - test_rag.py：27 项单测全过。
+     ✅ R3 自蒸馏 + 归因（2026-11-18）：rag.infer_applied_cards / compute_confidence_updates /
+        generalize_shape；eval_logic.compute_speedup；async_eval 每轮记录 source_features / speedup_vs_prev /
+        applied_cards，best 更快则蒸馏候选卡到 knowledge/candidates/（不自动污染 strategies/），置信度增量
+        落盘 results/{run_id}/knowledge_updates.json 供人工 review；新增 OCCUPANCY_01 卡（P1-2：latency+naive 不再 0 命中）。
+     待做（R4 实验）：失败→failure_modes 更新需 LLM 代码 diff；Recall@3 标注集与 kb on/off 消融数据尚未建。
 6. 接入 Profiling 性能分析工具 (Nsight Compute)
    · 完善：学习命令行工具，在宿主侧（WSL2）运行 ncu，抓取底层的显存带宽利用率、L2 Cache 命中率、SM 计算单元占用率。
    · 动作：如果发现“计算单元没吃满，但显存读取很高”，系统自动将“你的代码存在内存瓶颈”作为 Prompt 反馈给 AI。

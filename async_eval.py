@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -56,6 +57,9 @@ MATMUL_KERNEL_REGEX = r"(matmul|matMul|matrixMul|mat_mul|matrix_mul|sgemm|gemm)"
 # RAG 策略卡目录（RAG 设计 §1：knowledge/strategies/*.json）。
 # 用 rag.DEFAULT_STRATEGY_DIR（基于 __file__ 的绝对路径），避免 cwd 依赖（P0-1）。
 STRATEGY_DIR = rag.DEFAULT_STRATEGY_DIR
+
+# R3 自蒸馏候选卡落盘目录（相对 cwd；人工 review 后再合并进 strategies/，避免自动污染知识库）。
+CANDIDATES_DIR = os.path.join("knowledge", "candidates")
 
 
 def _knowledge_config():
@@ -302,6 +306,9 @@ def _empty_record(out_bin):
         "metrics": None,
         "feedback": None,
         "code": None,
+        "source_features": None,
+        "speedup_vs_prev": None,
+        "applied_cards": [],
         "retrieved_card_ids": None,
         "error_feedback": None,
         "compile_stdout_tail": None,
@@ -373,6 +380,29 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
     }
     # 每轮结构化记录，落盘用于回溯「瓶颈 → 策略 → 收益」证据链
     records = []
+
+    # R3 归因/自蒸馏的跨轮状态：追踪「上一成功轮」的源码特征/检索卡/有效耗时，
+    # 用于推断本轮实际应用了哪张卡（applied_cards）并计算加速比（speedup_vs_prev）。
+    prev_feats = None            # 上一成功轮的源码特征（roofline.source_features 输出）
+    prev_retrieved = []          # 上一轮检索并注入的卡 id（本轮尝试应用的对象）
+    prev_time = None             # 上一成功轮的有效耗时（秒）
+    first_ok_time = None         # 第一次成功 attempt 的有效耗时（蒸馏 speedup 基准）
+    best_source_features = None  # 当前 best 内核的源码特征（蒸馏候选卡指纹）
+    confidence_events = {}       # card_id -> {delta, current_confidence, rounds[]}
+
+    cards_by_id = {c.get("id"): c for c in cards}
+
+    def accumulate_confidence(cids, improved, attempt, applied):
+        """把一轮的置信度增量累加到 confidence_events（失败轮 improved=False 惩罚上轮注入卡）。"""
+        for cid in cids:
+            card = cards_by_id.get(cid)
+            current = float(card.get("confidence", 0.5)) if card else 0.5
+            delta = rag.compute_confidence_updates([cid], improved).get(cid, 0.0)
+            ev = confidence_events.setdefault(cid, {
+                "delta": 0.0, "current_confidence": current, "rounds": [],
+            })
+            ev["delta"] = round(ev["delta"] + delta, 6)
+            ev["rounds"].append({"attempt": attempt, "applied": bool(applied), "improved": bool(improved)})
 
     for attempt in range(max_retries):
         print(f"\n[{matrix_size}] ==========================================")
@@ -497,6 +527,9 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
                 )
             record["error_feedback"] = error_feedback
             messages.append({"role": "user", "content": error_feedback})
+            # R3：失败轮对上轮注入的卡给负置信度（模型被要求应用但编译/结果失败）
+            if prev_retrieved:
+                accumulate_confidence(prev_retrieved, False, attempt + 1, applied=False)
             records.append(record)
             continue
 
@@ -534,12 +567,28 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         record["metrics"] = metrics
         record["feedback"] = feedback
 
+        # R3 归因/蒸馏：源码特征 + 加速比，每轮成功都记录（无论瓶颈标签为何）
+        feats = roofline.source_features(pure_code)
+        record["source_features"] = feats
+        effective_time = ncu_time_sec if ncu_time_sec is not None else time_sec
+        record["speedup_vs_prev"] = eval_logic.compute_speedup(prev_time, effective_time)
+
+        # 归因：由上一轮检索卡 + 前后两轮源码特征变化推断本轮实际应用了哪张卡
+        applied_cards = []
+        if prev_feats is not None and prev_retrieved:
+            applied_cards = rag.infer_applied_cards(prev_retrieved, prev_feats, feats, cards)
+        record["applied_cards"] = applied_cards
+
+        # 置信度增量：应用卡按本轮是否更快给 +/-0.05（speedup>1 视为 improved）
+        improved = record["speedup_vs_prev"] is not None and record["speedup_vs_prev"] > 1.0
+        if applied_cards:
+            accumulate_confidence(applied_cards, improved, attempt + 1, applied=True)
+
         # 画像后检索（RAG 设计 §3.3）：按瓶颈指纹 + 源码特征检索策略卡，
         # 供下一轮反馈注入；结果记入 record 的 retrieved_card_ids 证据链
         fb_hits = []
         knowledge_feedback = None
         if label in ("memory", "compute", "latency"):
-            feats = roofline.source_features(pure_code)
             ncu_metrics = metrics if source == "ncu" else None
             fb_hits = retrieve_hits(bottleneck=label, source_features=feats, ncu_metrics=ncu_metrics)
             for h in fb_hits:
@@ -548,7 +597,8 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         record["retrieved_card_ids"] = [h["card"]["id"] for h in fb_hits]
 
         # best-so-far 更新：仅当「正确且更快」才更新（更快优先用 ncu 可信计时）
-        effective_time = ncu_time_sec if ncu_time_sec is not None else time_sec
+        if first_ok_time is None:
+            first_ok_time = effective_time
         if eval_logic.should_update_best(best["ok"], best["effective_time"], effective_time):
             best.update({
                 "ok": True,
@@ -564,12 +614,18 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
                 "metrics": metrics,
                 "feedback": feedback,
             })
+            best_source_features = feats
             if best["effective_time"] is not None:
                 print(f"[{matrix_size}] ✅ 更新最优：attempt {attempt + 1}，耗时 {best['effective_time']:.6f}s")
             else:
                 print(f"[{matrix_size}] ✅ 记录首个正确结果：attempt {attempt + 1}")
 
         records.append(record)
+
+        # 更新下一轮归因所用的「上一成功轮」状态
+        prev_feats = feats
+        prev_retrieved = [h["card"]["id"] for h in fb_hits]
+        prev_time = effective_time
 
         # 瓶颈识别 → 策略选择 → 自动迭代：memory/compute/latency 三类瓶颈都要接策略继续优化
         if label in ("memory", "compute", "latency") and attempt + 1 < max_retries:
@@ -586,12 +642,59 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
 
     # 循环结束：只要有 best 就返回成功；后续 attempt 失败不会「反杀」已找到的最优
     timestamp = datetime.now(timezone.utc).isoformat()
+
+    # R3 自蒸馏 + 置信度更新（仅知识库开启时；产物供人工 review 后合并）
+    candidates_created = []
+    knowledge_updates_applied = {}
+    if kb["enabled"]:
+        # 蒸馏：best 比第一次成功 attempt 更快 → 生成候选卡（不写 strategies/，避免自动污染）
+        speedup = eval_logic.compute_speedup(first_ok_time, best["effective_time"]) if best["ok"] else None
+        if speedup is not None and speedup > 1.0:
+            candidate = rag.distill_from_run({
+                "ok": True,
+                "bottleneck": best.get("bottleneck"),
+                "source_features": best_source_features or {},
+                "speedup": speedup,
+                "run_id": run_id,
+                "operator_spec": operator_spec,
+            })
+            if candidate:
+                os.makedirs(CANDIDATES_DIR, exist_ok=True)
+                cand_path = os.path.join(CANDIDATES_DIR, f"{run_id}-{matrix_size}.json")
+                with open(cand_path, "w", encoding="utf-8") as f:
+                    json.dump(candidate, f, ensure_ascii=False, indent=2, default=str)
+                candidates_created.append(candidate["id"])
+                print(f"[{matrix_size}] 🧪 蒸馏候选卡 {candidate['id']} → {cand_path}")
+
+        # 置信度增量落盘（人工 review 后再合并进卡片，保证知识增长可审计）
+        if confidence_events:
+            for cid, ev in confidence_events.items():
+                cur = ev["current_confidence"]
+                knowledge_updates_applied[cid] = {
+                    "delta": ev["delta"],
+                    "current_confidence": cur,
+                    "suggested_confidence": rag.clamp_confidence(cur + ev["delta"]),
+                    "rounds": ev["rounds"],
+                }
+            run_dir = os.path.join(RESULTS_DIR, str(run_id))
+            os.makedirs(run_dir, exist_ok=True)
+            updates_path = os.path.join(run_dir, "knowledge_updates.json")
+            with open(updates_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "run_id": run_id,
+                    "matrix_size": matrix_size,
+                    "updates": knowledge_updates_applied,
+                }, f, ensure_ascii=False, indent=2, default=str)
+            print(f"[{matrix_size}] 📝 置信度更新已落盘：{updates_path}")
+
     knowledge = {
         "enabled": kb["enabled"],
         "mode": kb["mode"],
         "top_k": kb["top_k"],
         "cards_loaded": len(cards),
         "retrieved_card_ids": sorted(retrieved_card_ids),
+        "candidates_created": candidates_created,
+        "knowledge_updates_applied": knowledge_updates_applied,
     }
     if knowledge_warning:
         knowledge["warning"] = knowledge_warning
