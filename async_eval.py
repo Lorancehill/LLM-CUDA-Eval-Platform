@@ -866,8 +866,9 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
 
 
 async def main():
-    # 我们同时测试 3 种不同的矩阵大小
-    sizes = [256, 512, 1024]
+    # 尺寸由 SIZES 环境变量控制（逗号分隔，缺省 256,512,1024）。
+    # P1：run_experiment 注入 SIZES，保证 smoke/分段实验只跑指定尺寸，不再写死三尺寸。
+    sizes = [int(x) for x in os.getenv("SIZES", "256,512,1024").split(",") if x.strip()]
 
     print("================ 开始并发评测 ================")
     if not await ensure_image():

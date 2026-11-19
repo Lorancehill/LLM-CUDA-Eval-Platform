@@ -169,6 +169,21 @@ def test_collect_results_timing_source_and_knowledge():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_collect_results_run_level_success():
+    tmp = tempfile.mkdtemp()
+    try:
+        _write_run(tmp, "run-ok", 256, 1e-5, [1e-5])
+        # 同 run 两个尺寸：256 成功、512 失败 → run 级 success 应为 False
+        _write_run(tmp, "run-partial", 256, 1e-5, [1e-5])
+        _write_run(tmp, "run-partial", 512, None, [None])
+        d = dashboard.collect_results(tmp)
+        by_id = {r["run_id"]: r for r in d["runs"]}
+        assert by_id["run-ok"]["success"] is True
+        assert by_id["run-partial"]["success"] is False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

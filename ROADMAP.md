@@ -7,6 +7,14 @@
 1. 多模型与多尺寸压测
    · 完善：接入 DeepSeek、通义千问、Kimi 等多个模型 API，测试 256, 512, 1024, 2048 等不同尺寸的矩阵。
    · 目的：积累至少 100 组数据，验证系统在不同场景下的鲁棒性，为写论文提供厚实的数据支撑。
+   · ✅ 周末跑批基建（2026-11-19，P0-3/P0-4 + P1/P2 修复）：
+     - run_experiment.py：一键跑批——kb×repeat 矩阵展开成独立子进程，经 RUN_ID/EXPERIMENT_ID/CONDITION/
+       REPEAT/KNOWLEDGE_ENABLED/SIZES 环境变量注入；结果归档 experiments/{exp}/runs/、日志 logs/、汇总 summary.csv；
+       失败自动重试 1 次，连败 2 次标记 skipped 不中断整批。
+     - preflight.py：开跑前预检（.env 密钥 / GPU / ncu / Docker 镜像 / 磁盘 / 全量离线单测），全部通过才开跑。
+     - P1 修复：--sizes 经 SIZES 环境变量真正传到 async_eval（原写死 256/512/1024，smoke/分段实验会数据不一致）。
+     - P2 修复：失败 run 隔离到 experiments/{exp}/failed/ 并剔除 results/index.jsonl，避免重试残留污染对比；
+       summary.csv 每尺寸补 timing_source / cards_loaded / applied_cards / candidates / 首轮 vs 最优，供论文表直出。
 2. 真正的“自我纠错”闭环 (Self-Correction)
    · 完善：目前的循环只是简单的重试。进阶为：通过 subprocess 捕获到具体的编译器报错（如 nvcc error 行号），将其自动拼接到新的 Prompt 中喂回大模型。
    · 目的：让系统真正具备“Agent（智能体）”的雏形，不再依赖人工干预。
@@ -20,7 +28,8 @@
        「轮次→可信耗时(ncu kernel-only)」对数折线图（点色=瓶颈分类）、
        相对首轮加速比折线图、ncu 四指标(SM/DRAM/占用率/L2)分轮柱状图、逐轮明细表。
      - 可信计时口径统一用 ncu_time_sec（与论文口径一致），自报 Time 仅作对照列；NaN/损坏索引行安全降级。
-     - test_dashboard.py：4 项离线单测全过（聚合排序、NaN 净化、空目录、损坏索引行容错）。
+     - test_dashboard.py：7 项离线单测全过（聚合排序、NaN 净化、空目录、损坏索引行容错、计时口径/知识库字段、
+       run 级成功判定）；跨 run 对比只列成功 run，失败 run 单视图可查（❌失败 标记）。
      - 说明：原计划 Streamlit/Gradio 会引入较重依赖，与 rag.py「零依赖」路线冲突，故用 stdlib 等价实现；
        若后续要网页端直接发评测请求，再在 dashboard.py 加一个 `/api/run` 触发 async_eval（见阶段二 Auto-tuning）。
 4. 完善防作弊与哈希校验

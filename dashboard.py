@@ -136,7 +136,7 @@ def collect_results(results_dir: str = RESULTS_DIR) -> dict:
       {
         "env": {…} 或 None,
         "generated_at": iso,
-        "runs": [ {run_id, timestamp, sizes: [size_entry, ...]}, ... ]  # 按时间升序
+        "runs": [ {run_id, timestamp, success, sizes: [size_entry, ...]}, ... ]  # 按时间升序
       }
     """
     index_path = os.path.join(results_dir, "index.jsonl")
@@ -194,6 +194,8 @@ def collect_results(results_dir: str = RESULTS_DIR) -> dict:
     runs = sorted(runs_map.values(), key=lambda r: (r.get("timestamp") or "", r["run_id"]))
     for r in runs:
         r["sizes"].sort(key=lambda s: s["matrix_size"])
+        # run 级成功 = 至少一个尺寸且全部尺寸成功（与 async_eval 退出码口径一致）
+        r["success"] = bool(r["sizes"]) and all(s["success"] for s in r["sizes"])
     return {"env": env, "generated_at": _now_iso(), "runs": runs}
 
 
@@ -351,9 +353,9 @@ async function load(){
     const cond=conds.length?conds.join(","):kb;
     const o=document.createElement("option");
     o.value=i;
-    o.textContent=`${run.run_id} · ${sizes} · ${cond} · ${(run.timestamp||"").replace("T"," ").slice(0,19)}`;
+    o.textContent=`${run.success===false?"❌失败 " : ""}${run.run_id} · ${sizes} · ${cond} · ${(run.timestamp||"").replace("T"," ").slice(0,19)}`;
     sel.appendChild(o);
-    cmp.appendChild(o.cloneNode(true));
+    if(run.success!==false) cmp.appendChild(o.cloneNode(true)); // 跨 run 对比只列成功 run
   });
   [...cmp.options].forEach(o=>{if(cmpPrev.includes(o.value))o.selected=true;});
   sel.onchange=()=>{RUN=DATA.runs[+sel.value];render();};
@@ -739,7 +741,7 @@ function renderCompareTable(runs){
 function renderCompare(){
   const sel=document.getElementById("cmpSel");
   const idxs=[...sel.selectedOptions].map(o=>+o.value);
-  const runs=idxs.map(i=>DATA&&DATA.runs[i]).filter(Boolean);
+  const runs=idxs.map(i=>DATA&&DATA.runs[i]).filter(r=>r&&r.success!==false);
   const panel=document.getElementById("comparePanel");
   if(runs.length<2){panel.style.display="none";return;}
   panel.style.display="block";

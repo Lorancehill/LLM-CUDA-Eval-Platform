@@ -67,6 +67,7 @@ def _child_env(args, cell: dict, run_id: str) -> dict:
     env["CONDITION"] = cell["condition"]
     env["REPEAT"] = str(cell["repeat"])
     env["RUN_ID"] = run_id
+    env["SIZES"] = ",".join(str(s) for s in cell["sizes"])
     env["KNOWLEDGE_ENABLED"] = "1" if cell["knowledge_enabled"] else "0"
     if args.topk is not None:
         env["KNOWLEDGE_TOPK"] = str(args.topk)
@@ -102,12 +103,27 @@ def run_one(args, cell: dict, run_id: str) -> tuple[int, str]:
             return 1, err_tail
 
 
+def _join_ids(ids) -> str:
+    """把 id 列表（或 None）压成 ';' 分隔字符串，供 CSV 单单元格落盘。"""
+    if not ids:
+        return ""
+    return ";".join(str(x) for x in ids)
+
+
 def read_run_metrics(run_id: str, sizes: list[int]) -> dict:
-    """从 results/{run_id}/{size}.json 读每个尺寸的 success + best effective_time。"""
+    """从 results/{run_id}/{size}.json 读每个尺寸的成功/计时/知识库字段（论文表用）。"""
     metrics = {"sizes": {}}
     for size in sizes:
         path = os.path.join(RESULTS_DIR, run_id, f"{size}.json")
-        entry = {"success": None, "best_sec": None}
+        entry = {
+            "success": None,
+            "best_sec": None,
+            "first_sec": None,
+            "timing_source": None,
+            "cards_loaded": None,
+            "applied_cards": "",
+            "candidates": "",
+        }
         if os.path.isfile(path):
             try:
                 with open(path, encoding="utf-8") as f:
@@ -115,6 +131,25 @@ def read_run_metrics(run_id: str, sizes: list[int]) -> dict:
                 entry["success"] = bool(data.get("success"))
                 best = data.get("best") or {}
                 entry["best_sec"] = best.get("effective_time")
+                # timing_source：与 dashboard 同口径（ncu 可信计时优先，缺则自报）
+                if best.get("ncu_time_sec") is not None:
+                    entry["timing_source"] = "ncu"
+                elif best.get("effective_time") is not None:
+                    entry["timing_source"] = "self"
+                kb = data.get("knowledge") or {}
+                entry["cards_loaded"] = kb.get("cards_loaded")
+                entry["candidates"] = _join_ids(kb.get("candidates_created"))
+                # 首轮成功耗时 + 应用卡并集（applied_cards 逐 attempt 记在 attempts 里）
+                applied: set[str] = set()
+                for a in data.get("attempts") or []:
+                    if a.get("ok") and entry["first_sec"] is None:
+                        t = a.get("ncu_time_sec")
+                        if t is None:
+                            t = a.get("time_sec")
+                        entry["first_sec"] = t
+                    for cid in a.get("applied_cards") or []:
+                        applied.add(str(cid))
+                entry["applied_cards"] = ";".join(sorted(applied))
                 # 环境快照（代码版本等）只读一次即可（同一 run 内各尺寸一致）
                 env = data.get("env") or {}
                 for k in ("git_commit", "git_dirty", "EXPERIMENT_ID", "CONDITION", "REPEAT"):
@@ -133,6 +168,47 @@ def archive_run(args, run_id: str) -> str | None:
         return None
     dst = os.path.join(HERE, "experiments", args.exp, "runs", run_id)
     shutil.copytree(src, dst, dirs_exist_ok=True)
+    return dst
+
+
+def _prune_index(run_id: str) -> None:
+    """从 results/index.jsonl 剔除某 run 的全部行（失败 run 隔离后，dashboard 不再读它）。"""
+    index_path = os.path.join(RESULTS_DIR, "index.jsonl")
+    if not os.path.isfile(index_path):
+        return
+    keep: list[str] = []
+    with open(index_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                keep.append(line)
+                continue
+            if str(row.get("run_id") or "") != run_id:
+                keep.append(line)
+    with open(index_path, "w", encoding="utf-8") as f:
+        for line in keep:
+            f.write(line + "\n")
+
+
+def _quarantine_run(args, run_id: str) -> str | None:
+    """把失败 run 从 results/{run_id}/ 移到 experiments/{exp}/failed/，并剔除 index 行。
+
+    返回目标路径；results/ 下无此目录则只剔索引并返回 None。
+    """
+    _prune_index(run_id)
+    src = os.path.join(RESULTS_DIR, run_id)
+    if not os.path.isdir(src):
+        return None
+    dst_dir = os.path.join(HERE, "experiments", args.exp, "failed")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, run_id)
+    if os.path.exists(dst):
+        dst = os.path.join(dst_dir, f"{run_id}-{uuid.uuid4().hex[:6]}")
+    shutil.move(src, dst)
     return dst
 
 
@@ -162,6 +238,11 @@ def _summary_row(args, cell: dict, run_id: str, status: str, metrics: dict,
     }
     for size, e in metrics["sizes"].items():
         row[f"best_{size}_sec"] = e["best_sec"]
+        row[f"first_{size}_sec"] = e["first_sec"]
+        row[f"{size}_timing_source"] = e["timing_source"] or ""
+        row[f"{size}_cards_loaded"] = e["cards_loaded"]
+        row[f"{size}_applied_cards"] = e["applied_cards"]
+        row[f"{size}_candidates"] = e["candidates"]
     if note:
         row["note"] = note
     return row
@@ -204,13 +285,16 @@ def main() -> int:
             print(f"[{i}/{len(cells)}] {cell['condition']} repeat={cell['repeat']} "
                   f"attempt={attempt} run_id={run_id} ...", flush=True)
             rc, err_tail = run_one(args, cell, run_id)
-            archive_run(args, run_id)
             metrics = read_run_metrics(run_id, cell["sizes"])
             if rc == 0:
+                archive_run(args, run_id)
                 final_run_id, final_metrics, status, note = run_id, metrics, "ok", ""
                 print(f"    ✅ 完成（{sum(1 for e in metrics['sizes'].values() if e['success'])}/"
                       f"{len(metrics['sizes'])} 尺寸成功）", flush=True)
                 break
+            # 失败 run 立即隔离：移出 results/、归档到 failed/、剔除 index 行，
+            # 避免重试成功后旧 run 被 dashboard 误当正常 run 参与跨 run 对比（P2）。
+            _quarantine_run(args, run_id)
             if attempt == 1:
                 print(f"    ⚠️ 失败（退出码 {rc}），重试 1 次...", flush=True)
                 continue
@@ -233,7 +317,10 @@ def main() -> int:
     exp_dir = os.path.join(HERE, "experiments", args.exp)
     os.makedirs(exp_dir, exist_ok=True)
     csv_path = os.path.join(exp_dir, "summary.csv")
-    size_cols = [f"best_{s}_sec" for s in cells[0]["sizes"]]
+    size_cols = []
+    for s in cells[0]["sizes"]:
+        size_cols += [f"best_{s}_sec", f"first_{s}_sec", f"{s}_timing_source",
+                      f"{s}_cards_loaded", f"{s}_applied_cards", f"{s}_candidates"]
     fieldnames = ["exp_id", "run_id", "condition", "kb", "repeat", "model", "status",
                   "n_ok", "n_sizes", "git_commit", "git_dirty"] + size_cols + ["note"]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:

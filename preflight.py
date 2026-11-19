@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
+import io
 import os
 import pathlib
 import shutil
@@ -45,7 +47,7 @@ def _run(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
 def check_dotenv() -> tuple[bool, str, str]:
     key = os.getenv("DEEPSEEK_API_KEY") or ""
     if key.strip():
-        return True, f"DEEPSEEK_API_KEY 已设置（{key[:8]}…{key[-4:]}）", ""
+        return True, f"DEEPSEEK_API_KEY 已设置（长度 {len(key.strip())}）", ""
     return False, "DEEPSEEK_API_KEY 缺失或为空", "在项目根 .env 里设置 DEEPSEEK_API_KEY=sk-xxx"
 
 
@@ -121,7 +123,10 @@ def _run_unit_tests() -> tuple[int, int, list[str]]:
             if not callable(fn):
                 continue
             try:
-                fn()
+                # 单测里的 print 很吵，统一吞掉；失败信息走异常文本
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    fn()
                 passed += 1
             except Exception as e:
                 failed += 1
