@@ -119,6 +119,56 @@ def test_collect_results_skips_corrupt_index_line():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_collect_results_scans_run_dirs_without_index():
+    tmp = tempfile.mkdtemp()
+    try:
+        _write_run(tmp, "run-scan", 256, 1e-5, [1e-5])
+        os.remove(os.path.join(tmp, "index.jsonl"))
+        d = dashboard.collect_results(tmp)
+        assert len(d["runs"]) == 1
+        assert d["runs"][0]["run_id"] == "run-scan"
+        s = d["runs"][0]["sizes"][0]
+        assert s["matrix_size"] == 256
+        assert s["best_time_sec"] == 1e-5
+        assert s["timing_source"] == "ncu"
+        assert d["env"] == {"gpu": "RTX 5060"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_collect_results_timing_source_and_knowledge():
+    tmp = tempfile.mkdtemp()
+    try:
+        _write_run(tmp, "run-self", 512, None, [None])
+        path = os.path.join(tmp, "run-self", "512.json")
+        data = json.loads(open(path, encoding="utf-8").read())
+        data["best"]["ncu_time_sec"] = None
+        data["best"]["effective_time"] = 7.5e-5
+        data["knowledge"] = {
+            "enabled": True,
+            "mode": "cards",
+            "top_k": 3,
+            "cards_loaded": 5,
+            "retrieved_card_ids": ["c1", "c2"],
+            "candidates_created": ["c3"],
+            "knowledge_updates_applied": {"c1": {"current_confidence": 0.5, "suggested_confidence": 0.6}},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=str)
+
+        d = dashboard.collect_results(tmp)
+        s = d["runs"][0]["sizes"][0]
+        assert s["timing_source"] == "self"
+        assert s["best_time_sec"] == 7.5e-5
+        assert s["knowledge_enabled"] is True
+        assert s["knowledge"]["cards_loaded"] == 5
+        assert s["knowledge"]["retrieved_card_ids"] == ["c1", "c2"]
+        assert s["knowledge"]["candidates_created"] == ["c3"]
+        assert s["knowledge"]["knowledge_updates_applied"]["c1"]["suggested_confidence"] == 0.6
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
