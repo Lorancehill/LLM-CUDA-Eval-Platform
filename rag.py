@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import math
@@ -409,16 +410,29 @@ def compute_confidence_updates(applied_ids, improved: bool) -> dict[str, float]:
     """每张应用卡本次的置信度增量：improved=True → +0.05，False → -0.05。
 
     返回「待合并增量」（delta）而非新的绝对置信度；合并时用 clamp_confidence 夹取到
-    [CONFIDENCE_MIN, CONFIDENCE_MAX]。knowledge_updates.json 记录增量，人工 review 后合并。
+    [CONFIDENCE_MIN, CONFIDENCE_MAX]。knowledge_updates_{N}.json 记录增量，人工 review 后合并。
     """
     delta = CONFIDENCE_STEP if improved else -CONFIDENCE_STEP
     return {cid: delta for cid in (applied_ids or [])}
 
 
 def _candidate_card_id(run_record: dict) -> str:
+    """候选卡 id：SELF_{run_id_clean}-{N}-a{attempt}。
+
+    P1-2：只含 run_id 会让同 run 多尺寸/多轮的候选卡重名，R3c 合并按 id 索引时
+    互覆盖。加入 matrix_size 与 attempt 后唯一；文件名与 id 一致。
+    """
     rid = str(run_record.get("run_id") or "")
     clean = re.sub(r"[^A-Za-z0-9]", "", rid)
-    return ("SELF_" + clean[:12]) if clean else "SELF_UNKNOWN"
+    base = ("SELF_" + clean[:12]) if clean else "SELF_UNKNOWN"
+    n = str(run_record.get("matrix_size") or "")
+    attempt = str(run_record.get("attempt") or "")
+    parts = [base]
+    if n:
+        parts.append(n)
+    if attempt:
+        parts.append(f"a{attempt}")
+    return "-".join(parts)
 
 
 def distill_from_run(run_record: dict) -> dict | None:
@@ -478,3 +492,138 @@ def distill_from_run(run_record: dict) -> dict | None:
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "last_validated": None,
     }
+
+
+# ---- R3c：把「待合并增量/证据」真正写回知识库的 CLI（P1-4） ----
+
+def load_updates(results_dir: str) -> dict[str, dict]:
+    """扫描 ``results/*/knowledge_updates_*.json``，聚合每张卡的待合并增量与证据。
+
+    返回 ``{card_id: {"delta": float, "evidence": [dict], "sources": [run_id]}}``。
+    并发安全（P0-1）：更新文件名已带尺寸，同 run 多尺寸各一份，不会互相覆盖。
+    """
+    pattern = os.path.join(results_dir, "*", "knowledge_updates_*.json")
+    agg: dict[str, dict] = {}
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        run_id = data.get("run_id")
+        for cid, upd in (data.get("updates") or {}).items():
+            entry = agg.setdefault(cid, {"delta": 0.0, "evidence": [], "sources": []})
+            entry["delta"] = round(entry["delta"] + float(upd.get("delta", 0.0)), 6)
+            for ev in upd.get("evidence") or []:
+                if run_id and not ev.get("run_id"):
+                    ev = dict(ev, run_id=run_id)
+                entry["evidence"].append(ev)
+            if run_id and run_id not in entry["sources"]:
+                entry["sources"].append(run_id)
+    return agg
+
+
+def apply_updates(strategies_dir: str, updates: dict[str, dict], dry_run: bool = False) -> list[str]:
+    """把聚合后的置信度增量与证据写回策略卡；返回被修改的卡 id 列表。
+
+    置信度用 clamp_confidence 夹取到 [CONFIDENCE_MIN, CONFIDENCE_MAX]；证据追加到
+    卡片 ``evidence`` 列表（不重复写入）。dry_run=True 只报告不落盘。
+    """
+    changed = []
+    for cid, upd in updates.items():
+        path = os.path.join(strategies_dir, f"{cid}.json")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            card = json.load(f)
+        cur = float(card.get("confidence", 0.5))
+        new_conf = clamp_confidence(cur + upd["delta"])
+        if not dry_run:
+            card["confidence"] = new_conf
+            card.setdefault("evidence", []).extend(upd["evidence"])
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(card, f, ensure_ascii=False, indent=2)
+        changed.append(cid)
+    return changed
+
+
+def promote_candidates(candidates_dir: str, strategies_dir: str, dry_run: bool = False) -> list[str]:
+    """把候选卡晋升进 strategies/（status 置 'curated'，人工 review 后执行）。
+
+    写成功后删除候选文件，避免二次晋升；dry_run=True 只报告不落盘。
+    """
+    promoted = []
+    for path in sorted(glob.glob(os.path.join(candidates_dir, "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                card = json.load(f)
+        except Exception:
+            continue
+        cid = card.get("id")
+        if not cid:
+            continue
+        card["status"] = "curated"
+        dest = os.path.join(strategies_dir, f"{cid}.json")
+        if not dry_run:
+            with open(dest, "w", encoding="utf-8") as f:
+                json.dump(card, f, ensure_ascii=False, indent=2)
+            os.remove(path)
+        promoted.append(cid)
+    return promoted
+
+
+def _cli() -> int:
+    parser = argparse.ArgumentParser(
+        description="RAG 知识库维护 CLI：查看/合并实验增量、晋升候选卡。"
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_updates = sub.add_parser("updates", help="查看待合并的置信度增量与证据")
+    p_updates.add_argument("--results", default="results")
+
+    p_merge = sub.add_parser("merge", help="把增量/证据写回策略卡并消费更新文件")
+    p_merge.add_argument("--results", default="results")
+    p_merge.add_argument("--strategies", default=DEFAULT_STRATEGY_DIR)
+    p_merge.add_argument("--dry-run", action="store_true", help="只报告不落盘")
+
+    p_promote = sub.add_parser("promote", help="把候选卡晋升进 strategies/")
+    p_promote.add_argument("--candidates", default=os.path.join(os.path.dirname(DEFAULT_STRATEGY_DIR), "candidates"))
+    p_promote.add_argument("--strategies", default=DEFAULT_STRATEGY_DIR)
+    p_promote.add_argument("--dry-run", action="store_true", help="只报告不落盘")
+
+    args = parser.parse_args()
+    if args.cmd == "updates":
+        agg = load_updates(args.results)
+        if not agg:
+            print("没有待合并的知识增量。")
+            return 0
+        for cid, entry in sorted(agg.items()):
+            print(f"- {cid}: delta={entry['delta']:+.3f} sources={entry['sources']} "
+                  f"evidence={len(entry['evidence'])}条")
+        return 0
+
+    if args.cmd == "merge":
+        agg = load_updates(args.results)
+        changed = apply_updates(args.strategies, agg, dry_run=args.dry_run)
+        for cid in changed:
+            print(f"{'[dry-run] ' if args.dry_run else ''}合并 {cid}: delta={agg[cid]['delta']:+.3f}")
+        # 消费已合并的更新文件（非 dry-run）
+        if not args.dry_run:
+            for path in sorted(glob.glob(os.path.join(args.results, "*", "knowledge_updates_*.json"))):
+                os.remove(path)
+        return 0
+
+    if args.cmd == "promote":
+        promoted = promote_candidates(args.candidates, args.strategies, dry_run=args.dry_run)
+        for cid in promoted:
+            print(f"{'[dry-run] ' if args.dry_run else ''}晋升候选卡 {cid}")
+        if not promoted:
+            print("没有可晋升的候选卡。")
+        return 0
+
+    parser.error(f"未知子命令：{args.cmd}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

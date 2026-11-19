@@ -262,6 +262,59 @@ def test_distill_generalizes_shape():
     assert card["evidence"][0]["N"] == 1024
 
 
+def test_candidate_card_id_includes_size_and_attempt():
+    cid = rag._candidate_card_id({"run_id": "20261201-101500-ab12cd", "matrix_size": 1024, "attempt": 3})
+    assert cid == "SELF_202612011015-1024-a3"
+    # 无尺寸/轮次时退化为仅 run_id 清洗
+    assert rag._candidate_card_id({"run_id": "abc"}) == "SELF_abc"
+
+
+def test_load_apply_updates_and_promote():
+    tmp = tempfile.mkdtemp()
+    try:
+        strategies = os.path.join(tmp, "strategies")
+        candidates = os.path.join(tmp, "candidates")
+        results = os.path.join(tmp, "results")
+        os.makedirs(strategies)
+        os.makedirs(candidates)
+        with open(os.path.join(strategies, "TILING_01.json"), "w") as f:
+            json.dump(make_card("TILING_01", confidence=0.6), f)
+
+        run_dir = os.path.join(results, "run-1")
+        os.makedirs(run_dir)
+        upd = {"run_id": "run-1", "matrix_size": 16, "updates": {
+            "TILING_01": {"delta": 0.05, "current_confidence": 0.6, "suggested_confidence": 0.65,
+                          "rounds": [{"attempt": 2, "applied": True, "improved": True}],
+                          "evidence": [{"run_id": "run-1", "matrix_size": 16, "attempt": 2, "speedup": 5.0}]}}}
+        with open(os.path.join(run_dir, "knowledge_updates_16.json"), "w") as f:
+            json.dump(upd, f)
+
+        agg = rag.load_updates(results)
+        assert agg["TILING_01"]["delta"] == 0.05
+        assert agg["TILING_01"]["evidence"][0]["speedup"] == 5.0
+
+        changed = rag.apply_updates(strategies, agg)
+        assert changed == ["TILING_01"]
+        with open(os.path.join(strategies, "TILING_01.json")) as f:
+            merged = json.load(f)
+        assert merged["confidence"] == 0.65
+        assert merged["evidence"][0]["speedup"] == 5.0
+
+        cand = {"id": "SELF_runx-16-a2", "version": 1, "status": "candidate", "confidence": 0.3,
+                "operator_family": ["matmul"], "semantics": {}, "fingerprint": {},
+                "transform": {"name": "self_distilled", "description": "d", "code_hint": "", "params": {}},
+                "expected_gain": "2x", "failure_modes": [], "evidence": [],
+                "provenance": "self", "created_at": "2026-11-19", "last_validated": None}
+        with open(os.path.join(candidates, "SELF_runx-16-a2.json"), "w") as f:
+            json.dump(cand, f)
+        promoted = rag.promote_candidates(candidates, strategies)
+        assert promoted == ["SELF_runx-16-a2"]
+        assert os.path.exists(os.path.join(strategies, "SELF_runx-16-a2.json"))
+        assert not os.path.exists(os.path.join(candidates, "SELF_runx-16-a2.json"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

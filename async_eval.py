@@ -30,6 +30,8 @@ gpu_sem = asyncio.Semaphore(1)
 TIMEOUT_SECONDS = 20
 # ncu 画像超时上限（秒）：ncu 需多次 replay kernel 采集全部指标，比普通运行慢得多
 NCU_TIMEOUT_SECONDS = 120
+# 内核计时重复次数（论文计时口径 3.1.4：跑 N 次取中位数，抗首轮冷启动/偶发抖动）
+TIMING_REPEATS = int(os.getenv("TIMING_REPEATS", "5") or "5")
 # API 调用超时 / 重试次数（B6：一次 API 抖动不应毁掉整批）
 API_TIMEOUT_SECONDS = 60
 API_RETRIES = 3
@@ -58,8 +60,9 @@ MATMUL_KERNEL_REGEX = r"(matmul|matMul|matrixMul|mat_mul|matrix_mul|sgemm|gemm)"
 # 用 rag.DEFAULT_STRATEGY_DIR（基于 __file__ 的绝对路径），避免 cwd 依赖（P0-1）。
 STRATEGY_DIR = rag.DEFAULT_STRATEGY_DIR
 
-# R3 自蒸馏候选卡落盘目录（相对 cwd；人工 review 后再合并进 strategies/，避免自动污染知识库）。
-CANDIDATES_DIR = os.path.join("knowledge", "candidates")
+# R3 自蒸馏候选卡落盘目录（基于 STRATEGY_DIR 派生的绝对路径，避免 cwd 依赖；P2-2）。
+# 人工 review 后再合并进 strategies/，避免自动污染知识库。
+CANDIDATES_DIR = os.path.join(os.path.dirname(rag.DEFAULT_STRATEGY_DIR), "candidates")
 
 
 def _knowledge_config():
@@ -212,24 +215,63 @@ async def ensure_image():
     return False
 
 
-def probe_host_ncu():
-    """探测宿主 ncu 是否可用且认识 gb206，返回 (ok, message)。"""
+_ncu_bin_cache: str | None = None
+_ncu_gb206_cache: bool | None = None
+
+
+def _ncu_supports_gb206(ncu_bin: str) -> bool:
+    """运行 ``ncu --list-chips`` 判断该二进制是否认识 gb206（Blackwell 关键判据）。"""
     try:
-        r = subprocess.run(["ncu", "--version"], capture_output=True, timeout=15, text=True)
+        chips = subprocess.run([ncu_bin, "--list-chips"], capture_output=True, timeout=15, text=True)
+    except Exception:
+        return False
+    return "gb206" in ((chips.stdout or "") + (chips.stderr or "")).lower()
+
+
+def _resolve_ncu() -> tuple[str, bool]:
+    """在候选里挑第一个认识 gb206 的 ncu 二进制，返回 (bin, gb206_ok)。
+
+    新版 ncu（2026.x，支持 gb206）常装在 ``~/.local/nsight-compute/*/ncu`` 且不进 PATH，
+    系统 PATH 里的 ``/usr/bin/ncu`` 还是 2024.1.1（不认识 gb206）。逐个候选跑
+    ``--list-chips``，命中 gb206 才采用；否则退回首选候选（上层会告警并降级 roofline）。
+    """
+    candidates = profiler.list_ncu_candidates()
+    for cand in candidates:
+        if _ncu_supports_gb206(cand):
+            return cand, True
+    return (candidates[0] if candidates else "ncu"), False
+
+
+def get_ncu_bin() -> str:
+    """返回本次运行要用的 ncu 二进制路径（懒加载 + 缓存，全进程只探测一次）。"""
+    global _ncu_bin_cache
+    if _ncu_bin_cache is None:
+        _ncu_bin_cache, _ = _resolve_ncu()
+    return _ncu_bin_cache
+
+
+def ncu_supports_gb206() -> bool:
+    """本次运行采用的 ncu 是否认识 gb206（懒加载 + 缓存，与 get_ncu_bin 共享探测）。"""
+    global _ncu_gb206_cache
+    if _ncu_gb206_cache is None:
+        _, _ncu_gb206_cache = _resolve_ncu()
+    return _ncu_gb206_cache
+
+
+def probe_host_ncu():
+    """探测本次运行将采用的 ncu 是否可用且认识 gb206，返回 (ok, message)。"""
+    ncu_bin = get_ncu_bin()
+    try:
+        r = subprocess.run([ncu_bin, "--version"], capture_output=True, timeout=15, text=True)
     except FileNotFoundError:
-        return False, "宿主未安装 ncu（PATH 中无 ncu）"
+        return False, f"宿主未安装 ncu（候选路径均不可用：{profiler.list_ncu_candidates()}）"
     except Exception as e:
         return False, f"ncu 探测异常：{e}"
     if r.returncode != 0:
         return False, f"ncu 无法执行：{(r.stderr or r.stdout).strip()[-120:]}"
-    try:
-        chips = subprocess.run(["ncu", "--list-chips"], capture_output=True, timeout=15, text=True)
-    except Exception as e:
-        return False, f"ncu --list-chips 异常：{e}"
-    chip_txt = (chips.stdout or "") + (chips.stderr or "")
-    if "gb206" in chip_txt.lower():
-        return True, "ncu 可用且认识 gb206"
-    return False, "ncu 已安装但不认识 gb206（--list-chips 无 gb206，需升级）"
+    if ncu_supports_gb206():
+        return True, f"ncu 可用且认识 gb206（{ncu_bin}）"
+    return False, f"ncu 已安装但不认识 gb206（--list-chips 无 gb206，需升级；当前用 {ncu_bin}）"
 
 
 def collect_env_snapshot():
@@ -258,12 +300,29 @@ def collect_env_snapshot():
     snap["gpu"] = _run(
         ["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"]
     ) or "unavailable"
-    ncu_ver = _run(["ncu", "--version"])
-    snap["ncu_version"] = ncu_ver.splitlines()[0] if ncu_ver else "unavailable"
+    # GPU 温度/功耗/时钟（论文计时口径 3.1.4：记录运行态环境，佐证计时可信度）
+    snap["gpu_temp_power"] = _run(
+        ["nvidia-smi", "--query-gpu=temperature.gpu,power.draw,clocks.sm,clocks.mem", "--format=csv,noheader"]
+    ) or "unavailable"
+    ncu_bin = get_ncu_bin()
+    snap["ncu_bin"] = ncu_bin
+    ncu_ver = _run([ncu_bin, "--version"])
+    # 记录含 "Version" 的完整版本行（如 "Version 2026.4.0.0 …"）；第一行只是版权标题。
+    snap["ncu_version"] = _ncu_version_line(ncu_ver)
     snap["cuda_image"] = _run(
         ["docker", "image", "inspect", CUDA_IMAGE, "--format", "{{.Id}}"]
     ) or "unavailable"
     return snap
+
+
+def _ncu_version_line(ncu_ver: str) -> str:
+    """取 ncu --version 里含 'Version' 的那一行（完整版本号）；无则退回首行。"""
+    if not ncu_ver or ncu_ver.startswith("unavailable"):
+        return ncu_ver or "unavailable"
+    for line in ncu_ver.splitlines():
+        if "Version" in line:
+            return line.strip()
+    return ncu_ver.splitlines()[0].strip() if ncu_ver.strip() else "unavailable"
 
 
 async def _profile_kernel(matrix_size, binary, kernel_name=None):
@@ -273,7 +332,7 @@ async def _profile_kernel(matrix_size, binary, kernel_name=None):
     注意：容器编译出的二进制在宿主运行需宿主有对应 CUDA runtime（libcudart）；
     若缺失，ncu 会加载失败，此处优雅降级（上层回落到 roofline proxy）。
     """
-    cmd_list = shlex.split(profiler.build_ncu_cmd(binary, kernel_name))
+    cmd_list = shlex.split(profiler.build_ncu_cmd(binary, kernel_name, ncu_bin=get_ncu_bin()))
     async with gpu_sem:
         try:
             _, stdout, stderr, timed_out = await _run_host(cmd_list, NCU_TIMEOUT_SECONDS)
@@ -359,8 +418,10 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
     ref = validate.reference_matmul(matrix_size)
     out_bin = f"cuda_output_{matrix_size}.bin"
 
-    # 记录每一次 attempt 的内核耗时（秒）；无输出（超时/编译失败）记 None
+    # 记录每一次 attempt 的内核耗时（秒）；无输出（超时/编译失败）记 None。
+    # timings = 自报 Time（对照用）；ncu_timings = ncu 可信计时（论文口径 3.1.3）。
     timings = []
+    ncu_timings = []
 
     # best-so-far：只在「结果正确 且 更快」时更新。即使后续 attempt 把模型改坏，
     # 也不会丢掉前面已找到的正确且更快的内核（P0：成功后继续优化，失败会「反杀」成功）。
@@ -388,12 +449,16 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
     prev_time = None             # 上一成功轮的有效耗时（秒）
     first_ok_time = None         # 第一次成功 attempt 的有效耗时（蒸馏 speedup 基准）
     best_source_features = None  # 当前 best 内核的源码特征（蒸馏候选卡指纹）
-    confidence_events = {}       # card_id -> {delta, current_confidence, rounds[]}
+    best_applied_cards = []      # 当前 best attempt 实际应用的卡（P1-1：非空则只追加证据，不蒸馏新卡）
+    confidence_events = {}       # card_id -> {delta, current_confidence, rounds[], evidence[]}
 
     cards_by_id = {c.get("id"): c for c in cards}
 
-    def accumulate_confidence(cids, improved, attempt, applied):
-        """把一轮的置信度增量累加到 confidence_events（失败轮 improved=False 惩罚上轮注入卡）。"""
+    def accumulate_confidence(cids, improved, attempt, applied, speedup=None):
+        """把一轮的置信度增量累加到 confidence_events（失败轮 improved=False 惩罚上轮注入卡）。
+
+        提速且真正应用时（improved 且 applied）追加 evidence（run_id/matrix_size/speedup），
+        供 R3c 合并 CLI 写回卡片 evidence（P1-4）。"""
         for cid in cids:
             card = cards_by_id.get(cid)
             current = float(card.get("confidence", 0.5)) if card else 0.5
@@ -403,6 +468,13 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             })
             ev["delta"] = round(ev["delta"] + delta, 6)
             ev["rounds"].append({"attempt": attempt, "applied": bool(applied), "improved": bool(improved)})
+            if improved and applied and speedup is not None:
+                ev.setdefault("evidence", []).append({
+                    "run_id": run_id,
+                    "matrix_size": matrix_size,
+                    "attempt": attempt,
+                    "speedup": round(float(speedup), 4),
+                })
 
     for attempt in range(max_retries):
         print(f"\n[{matrix_size}] ==========================================")
@@ -441,10 +513,12 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
 
         # 这里加了 --rm 自动清理容器，并执行编译和运行
         container_name = f"test_{matrix_size}_attempt{attempt + 1}"
+        # 内核计时跑 TIMING_REPEATS 次取中位数（论文口径 3.1.4：抗首轮冷启动/抖动）
+        run_repeats = " && ".join(f"./{binary}" for _ in range(TIMING_REPEATS))
         cmd = (
             f"docker run --rm --name {container_name} --memory=2g --cpus=1.0 --network none "
             f"-v $(pwd):/app --gpus all {CUDA_IMAGE} "
-            f"bash -c 'cd /app && nvcc -arch=sm_120 {cu_filename} -o {binary} && ./{binary}'"
+            f"bash -c 'cd /app && nvcc -arch=sm_120 {cu_filename} -o {binary} && {run_repeats}'"
         )
 
         # 异步执行外部命令（GPU 串行，API 并发）
@@ -459,9 +533,11 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         stdout_str = stdout.decode(errors="replace")
         stderr_str = stderr.decode(errors="replace")
 
-        # 记录本次 attempt 的内核耗时（秒）；无 'Time:' 输出记 None
-        time_sec = eval_logic.parse_time_seconds(stdout_str)
+        # 记录本次 attempt 的内核耗时（秒）；无 'Time:' 输出记 None。
+        # 论文口径：TIMING_REPEATS 次重复取中位数（自报 Time 仅作对照，见 3.1.3）。
+        time_sec = eval_logic.parse_time_seconds_median(stdout_str)
         timings.append(time_sec)
+        ncu_timings.append(None)  # 成功轮画像后被覆盖为 ncu 可信计时
 
         # 读取 CUDA 输出矩阵，与 numpy 参考做按尺寸校准的容差校验
         ok = False
@@ -562,6 +638,7 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             print(f"[{matrix_size}] 🧭 瓶颈分类: {label}（{source}）")
 
         record["ncu_time_sec"] = ncu_time_sec
+        ncu_timings[-1] = ncu_time_sec
         record["profile_source"] = source
         record["bottleneck"] = label
         record["metrics"] = metrics
@@ -582,7 +659,8 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
         # 置信度增量：应用卡按本轮是否更快给 +/-0.05（speedup>1 视为 improved）
         improved = record["speedup_vs_prev"] is not None and record["speedup_vs_prev"] > 1.0
         if applied_cards:
-            accumulate_confidence(applied_cards, improved, attempt + 1, applied=True)
+            accumulate_confidence(applied_cards, improved, attempt + 1, applied=True,
+                                  speedup=record["speedup_vs_prev"])
 
         # 画像后检索（RAG 设计 §3.3）：按瓶颈指纹 + 源码特征检索策略卡，
         # 供下一轮反馈注入；结果记入 record 的 retrieved_card_ids 证据链
@@ -615,6 +693,7 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
                 "feedback": feedback,
             })
             best_source_features = feats
+            best_applied_cards = applied_cards
             if best["effective_time"] is not None:
                 print(f"[{matrix_size}] ✅ 更新最优：attempt {attempt + 1}，耗时 {best['effective_time']:.6f}s")
             else:
@@ -647,45 +726,65 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
     candidates_created = []
     knowledge_updates_applied = {}
     if kb["enabled"]:
-        # 蒸馏：best 比第一次成功 attempt 更快 → 生成候选卡（不写 strategies/，避免自动污染）
+        # 蒸馏判断：best 比第一次成功 attempt 更快（speedup>1）才可能产出新知识。
         speedup = eval_logic.compute_speedup(first_ok_time, best["effective_time"]) if best["ok"] else None
+        distill_candidate = None
         if speedup is not None and speedup > 1.0:
-            candidate = rag.distill_from_run({
-                "ok": True,
-                "bottleneck": best.get("bottleneck"),
-                "source_features": best_source_features or {},
-                "speedup": speedup,
-                "run_id": run_id,
-                "operator_spec": operator_spec,
-            })
-            if candidate:
-                os.makedirs(CANDIDATES_DIR, exist_ok=True)
-                cand_path = os.path.join(CANDIDATES_DIR, f"{run_id}-{matrix_size}.json")
-                with open(cand_path, "w", encoding="utf-8") as f:
-                    json.dump(candidate, f, ensure_ascii=False, indent=2, default=str)
-                candidates_created.append(candidate["id"])
-                print(f"[{matrix_size}] 🧪 蒸馏候选卡 {candidate['id']} → {cand_path}")
-
-        # 置信度增量落盘（人工 review 后再合并进卡片，保证知识增长可审计）
-        if confidence_events:
-            for cid, ev in confidence_events.items():
-                cur = ev["current_confidence"]
-                knowledge_updates_applied[cid] = {
-                    "delta": ev["delta"],
-                    "current_confidence": cur,
-                    "suggested_confidence": rag.clamp_confidence(cur + ev["delta"]),
-                    "rounds": ev["rounds"],
-                }
-            run_dir = os.path.join(RESULTS_DIR, str(run_id))
-            os.makedirs(run_dir, exist_ok=True)
-            updates_path = os.path.join(run_dir, "knowledge_updates.json")
-            with open(updates_path, "w", encoding="utf-8") as f:
-                json.dump({
+            if best_applied_cards:
+                # P1-1：提速来自应用**知识库里已有的卡** → 只追加 evidence（已随
+                # confidence_events 记录），不再蒸馏重复候选卡，避免候选库堆满已知策略副本。
+                print(
+                    f"[{matrix_size}] 🧪 提速来自已应用策略卡 {best_applied_cards}，"
+                    "跳过新候选卡蒸馏（证据已入 knowledge_updates）"
+                )
+            else:
+                distill_candidate = rag.distill_from_run({
+                    "ok": True,
+                    "bottleneck": best.get("bottleneck"),
+                    "source_features": best_source_features or {},
+                    "speedup": speedup,
                     "run_id": run_id,
                     "matrix_size": matrix_size,
-                    "updates": knowledge_updates_applied,
-                }, f, ensure_ascii=False, indent=2, default=str)
-            print(f"[{matrix_size}] 📝 置信度更新已落盘：{updates_path}")
+                    "attempt": best.get("attempt"),
+                    "operator_spec": operator_spec,
+                })
+
+        # 置信度增量 → knowledge_updates_applied（纯逻辑，供 payload 与合并 CLI 使用）
+        for cid, ev in confidence_events.items():
+            cur = ev["current_confidence"]
+            knowledge_updates_applied[cid] = {
+                "delta": ev["delta"],
+                "current_confidence": cur,
+                "suggested_confidence": rag.clamp_confidence(cur + ev["delta"]),
+                "rounds": ev["rounds"],
+                "evidence": ev.get("evidence", []),
+            }
+
+        # 落盘（P1-3：整块 I/O 包 try/except，失败只告警，绝不阻断 persist_result）
+        try:
+            if distill_candidate:
+                os.makedirs(CANDIDATES_DIR, exist_ok=True)
+                # P1-2：文件名与候选卡 id 一致（id 已含 {N}-a{attempt}），避免跨尺寸互覆盖
+                cand_path = os.path.join(CANDIDATES_DIR, f"{distill_candidate['id']}.json")
+                with open(cand_path, "w", encoding="utf-8") as f:
+                    json.dump(distill_candidate, f, ensure_ascii=False, indent=2, default=str)
+                candidates_created.append(distill_candidate["id"])
+                print(f"[{matrix_size}] 🧪 蒸馏候选卡 {distill_candidate['id']} → {cand_path}")
+
+            if confidence_events:
+                run_dir = os.path.join(RESULTS_DIR, str(run_id))
+                os.makedirs(run_dir, exist_ok=True)
+                # P0-1：文件名带尺寸，避免并发尺寸间互相覆盖同一 knowledge_updates.json
+                updates_path = os.path.join(run_dir, f"knowledge_updates_{matrix_size}.json")
+                with open(updates_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "run_id": run_id,
+                        "matrix_size": matrix_size,
+                        "updates": knowledge_updates_applied,
+                    }, f, ensure_ascii=False, indent=2, default=str)
+                print(f"[{matrix_size}] 📝 置信度更新已落盘：{updates_path}")
+        except Exception as e:
+            print(f"[{matrix_size}] ⚠️ R3 蒸馏/更新落盘失败（不影响评测结果）：{e}")
 
     knowledge = {
         "enabled": kb["enabled"],
@@ -720,9 +819,9 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             print(f"[{matrix_size}] ✅ 完成：最优 attempt {best['attempt']}，耗时 {best['effective_time']:.6f}s")
         else:
             print(f"[{matrix_size}] ✅ 完成：最优 attempt {best['attempt']}")
-        return True, timings
+        return True, timings, ncu_timings
     print(f"[{matrix_size}] 🚨 达到最大重试次数，失败。")
-    return False, timings
+    return False, timings, ncu_timings
 
 
 async def main():
@@ -748,21 +847,29 @@ async def main():
         if isinstance(res, Exception):
             print(f"[汇总] 尺寸 {size}: ❌异常 {res!r}")
         else:
-            ok, _timings = res
+            ok, _timings, _ncu_timings = res
             print(f"[汇总] 尺寸 {size}: {'✅成功' if ok else '❌失败'}")
 
-    # 打印每个尺寸各次 attempt 的内核耗时列表（单位：秒），供画性能演进图
+    # 打印每个尺寸各次 attempt 的内核耗时列表（单位：秒），供画性能演进图。
+    # 论文口径 3.1.3：以 ncu 可信计时（kernel-only）为准，自报 Time 作对照。
     def fmt(t):
         return "None" if t is None else f"{t:.6f}"
 
-    print("\n================ 性能演进（每次 attempt 耗时，单位：秒） ================")
+    print("\n========== 性能演进：ncu 可信计时（每次 attempt，秒） ==========")
     for size, res in zip(sizes, results):
         if isinstance(res, Exception):
             print(f"[{size}] [异常]")
             continue
-        _ok, timings = res
+        _ok, _timings, ncu_timings = res
+        print(f"[{size}] [{', '.join(fmt(t) for t in ncu_timings)}]")
+    print("\n========== 对照：自报 Time（每次 attempt，秒） ==========")
+    for size, res in zip(sizes, results):
+        if isinstance(res, Exception):
+            print(f"[{size}] [异常]")
+            continue
+        _ok, timings, _ncu_timings = res
         print(f"[{size}] [{', '.join(fmt(t) for t in timings)}]")
-    print("======================================================================")
+    print("==============================================================")
     print("================ 评测全部结束 ================")
 
 

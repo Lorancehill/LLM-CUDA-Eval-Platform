@@ -14,6 +14,19 @@ def test_parse_time_seconds():
     assert eval_logic.parse_time_seconds("no time here") is None
 
 
+def test_parse_time_seconds_median():
+    # 5 次重复取中位数（抗首轮冷启动/抖动）
+    out = "\n".join(f"Time: {t} seconds" for t in [1.0, 2.0, 3.0, 4.0, 100.0])
+    assert eval_logic.parse_time_seconds_median(out) == 3.0
+    # 偶数个取中间两数均值
+    out2 = "\n".join(f"Time: {t} seconds" for t in [1.0, 2.0, 3.0, 4.0])
+    assert eval_logic.parse_time_seconds_median(out2) == 2.5
+    # 单个值 = 它本身
+    assert eval_logic.parse_time_seconds_median("Time: 0.5 seconds") == 0.5
+    # 无匹配 → None
+    assert eval_logic.parse_time_seconds_median("no time") is None
+
+
 def test_should_update_best_boundary():
     # 首次正确：无条件记录
     assert eval_logic.should_update_best(False, None, None) is True

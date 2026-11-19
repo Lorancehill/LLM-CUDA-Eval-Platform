@@ -52,6 +52,26 @@ def test_build_ncu_cmd_kernel_name_filter():
     assert "--kernel-name-base" not in no_kernel
 
 
+def test_build_ncu_cmd_uses_custom_bin():
+    cmd = profiler.build_ncu_cmd("test_1024", ncu_bin="/opt/ncu/2026.4.0/ncu")
+    assert cmd.startswith("/opt/ncu/2026.4.0/ncu --csv")
+    # 默认仍是 "ncu"
+    assert profiler.build_ncu_cmd("test_1024").startswith("ncu --csv")
+
+
+def test_list_ncu_candidates_explicit_first():
+    cands = profiler.list_ncu_candidates({"NCU_BIN": "/opt/ncu/custom"})
+    assert cands[0] == "/opt/ncu/custom"
+    # 兜底 "ncu" 始终在候选末尾
+    assert "ncu" in cands
+
+
+def test_list_ncu_candidates_falls_back_to_ncu():
+    # PATH 里有没有 ncu 都应包含兜底 "ncu"
+    cands = profiler.list_ncu_candidates({})
+    assert "ncu" in cands
+
+
 def test_parse_ncu_csv_ignores_app_noise():
     m = profiler.parse_ncu_csv(_fake_ncu_csv())
     assert m["gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"] == 78.5

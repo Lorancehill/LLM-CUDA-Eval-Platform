@@ -99,7 +99,7 @@ def test_loop_three_bottlenecks_pick_fastest():
             ]),
         )
 
-        ok, timings = asyncio.run(async_eval.evaluate_matrix(N, "run-test", {"python": "test"}))
+        ok, timings, _ncu_timings = asyncio.run(async_eval.evaluate_matrix(N, "run-test", {"python": "test"}))
         assert ok is True
         assert timings == times
 
@@ -144,7 +144,7 @@ def test_loop_failure_does_not_kill_best():
             _profile_kernel=_make_fake_profile([None, None, None]),
         )
 
-        ok, timings = asyncio.run(async_eval.evaluate_matrix(N, "run-test2", {"python": "test"}))
+        ok, timings, _ncu_timings = asyncio.run(async_eval.evaluate_matrix(N, "run-test2", {"python": "test"}))
         assert ok is True
         assert timings == [0.5, None, None]
 

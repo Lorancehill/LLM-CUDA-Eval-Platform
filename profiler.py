@@ -15,7 +15,10 @@
 from __future__ import annotations
 
 import csv
+import glob
 import io
+import os
+import shutil
 
 # 要抓取的 ncu 指标（在 Blackwell sm_120 上稳定存在，均为 ncu 文档化指标）。
 # 除 gpu__time_duration.sum（单位 ns）外，其余均为 0~100 的百分比。
@@ -41,7 +44,40 @@ DRAM_BOUND_PCT = 60.0    # 显存带宽利用率 >= 60% 视为「显存读取很
 SM_SATURATED_PCT = 60.0  # SM 占用率 >= 60% 视为「计算单元吃满」
 
 
-def build_ncu_cmd(binary: str, kernel_name: str | None = None) -> str:
+def list_ncu_candidates(env: dict | None = None) -> list[str]:
+    """返回候选 ncu 二进制路径（按优先级，纯函数、不跑子进程）。
+
+    新版 ncu（支持 gb206 的 2026.x）常装在 ``~/.local/nsight-compute/*/ncu`` 且**不进
+    PATH**——普通 shell 里的 ``ncu`` 仍是旧的 /usr/bin/ncu（2024.1.1，不支持 gb206），
+    直接跑会静默退化到 roofline（见论文可行性清单 3.1.1）。
+
+    优先级：
+    1. ``NCU_BIN`` 环境变量（显式指定，最高优先级）；
+    2. ``~/.local/nsight-compute/*/ncu``（自装新版，按目录版本号新→旧排序）；
+    3. ``shutil.which("ncu")``（PATH 中的 ncu，通常是系统旧版）；
+    4. 兜底字符串 ``"ncu"``（交给 subprocess 报 FileNotFoundError，上层优雅降级）。
+
+    ``env`` 参数供测试注入；缺省取 ``os.environ``。
+    """
+    env = os.environ if env is None else env
+    candidates: list[str] = []
+    explicit = (env.get("NCU_BIN") or "").strip()
+    if explicit:
+        candidates.append(explicit)
+    home = os.path.expanduser("~")
+    pattern = os.path.join(home, ".local", "nsight-compute", "*", "ncu")
+    # glob 按字典序排列，"2024.1.0" < "2026.4.0"，reverse=True 使新版在前。
+    for path in sorted(glob.glob(pattern), reverse=True):
+        candidates.append(path)
+    which = shutil.which("ncu")
+    if which and which not in candidates:
+        candidates.append(which)
+    if "ncu" not in candidates:
+        candidates.append("ncu")
+    return candidates
+
+
+def build_ncu_cmd(binary: str, kernel_name: str | None = None, ncu_bin: str = "ncu") -> str:
     """构造在宿主侧运行的 ncu 命令行（默认只 profile 第一次 kernel launch，输出 CSV）。
 
     kernel_name 传入**正则片段**（不含 ``regex:`` 前缀），用于在多 kernel 代码中只
@@ -54,7 +90,7 @@ def build_ncu_cmd(binary: str, kernel_name: str | None = None) -> str:
     - ``--kernel-name-base demangled``：按 demangled 内核名匹配正则。
     """
     base = (
-        "ncu --csv --print-metric-name name "
+        f"{ncu_bin} --csv --print-metric-name name "
         "--clock-control none --target-processes all "
     )
     if kernel_name:

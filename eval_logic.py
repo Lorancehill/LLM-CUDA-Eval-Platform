@@ -11,10 +11,25 @@ import os
 import re
 
 
+_TIME_RE = re.compile(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
+
+
 def parse_time_seconds(stdout_str: str) -> float | None:
     """从 CUDA 输出解析 'Time: xxx seconds' 中的秒数；无匹配返回 None。"""
-    m = re.search(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)", stdout_str or "")
+    m = _TIME_RE.search(stdout_str or "")
     return float(m.group(1)) if m else None
+
+
+def parse_time_seconds_median(stdout_str: str) -> float | None:
+    """解析全部 'Time: xxx seconds' 并返回中位数（论文计时口径：多次重复取中位数，
+    抗首轮冷启动/偶发抖动）；无匹配返回 None。"""
+    vals = [float(m.group(1)) for m in _TIME_RE.finditer(stdout_str or "")]
+    if not vals:
+        return None
+    vals.sort()
+    n = len(vals)
+    mid = n // 2
+    return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
 def should_update_best(best_ok: bool, best_time: float | None, new_time: float | None) -> bool:
