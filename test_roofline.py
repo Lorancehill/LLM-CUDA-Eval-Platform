@@ -55,6 +55,16 @@ def test_roofline_unknown_without_time():
     assert "无可用计时" in feedback
 
 
+def test_roofline_clamps_utilization_at_100():
+    # 自报计时极快 → 利用率 >100%（如 207%），应夹到 1.0（P1）
+    label, feedback, m = roofline.roofline_classify(
+        256, time_sec=1e-9, code="__shared__ float t[16][16];"
+    )
+    assert m["compute_utilization"] == 1.0
+    assert m["memory_utilization"] == 1.0
+    assert "100.00%" in roofline.format_proxy_metrics(m)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shutil
 from datetime import datetime, timezone
 
 # ---- 软打分权重：score = w1*bm25_norm + w2*confidence + w3*recency ----
@@ -523,11 +524,32 @@ def load_updates(results_dir: str) -> dict[str, dict]:
     return agg
 
 
+def _evidence_key(ev: dict) -> str:
+    """证据去重键：按内容排序后的 JSON（等价证据不重复写入）。"""
+    return json.dumps(ev, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def missing_card_ids(updates: dict[str, dict], strategies_dir: str) -> list[str]:
+    """返回 updates 中在 strategies_dir 里没有对应卡文件的 id（merge 时需保留其更新文件）。"""
+    return [cid for cid in updates if not os.path.exists(os.path.join(strategies_dir, f"{cid}.json"))]
+
+
+def _update_file_has_missing(path: str, missing: set[str]) -> bool:
+    """判断单个 knowledge_updates_*.json 是否引用了任一缺失的卡 id。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    return bool(missing & set((data.get("updates") or {}).keys()))
+
+
 def apply_updates(strategies_dir: str, updates: dict[str, dict], dry_run: bool = False) -> list[str]:
     """把聚合后的置信度增量与证据写回策略卡；返回被修改的卡 id 列表。
 
     置信度用 clamp_confidence 夹取到 [CONFIDENCE_MIN, CONFIDENCE_MAX]；证据追加到
-    卡片 ``evidence`` 列表（不重复写入）。dry_run=True 只报告不落盘。
+    卡片 ``evidence`` 列表并按内容去重（P1：反复 merge 不重复堆积）。写卡前先备份为
+    ``{cid}.json.bak``（P1：merge 可回滚）。dry_run=True 只报告不落盘。
     """
     changed = []
     for cid, upd in updates.items():
@@ -539,8 +561,15 @@ def apply_updates(strategies_dir: str, updates: dict[str, dict], dry_run: bool =
         cur = float(card.get("confidence", 0.5))
         new_conf = clamp_confidence(cur + upd["delta"])
         if not dry_run:
+            shutil.copyfile(path, path + ".bak")
             card["confidence"] = new_conf
-            card.setdefault("evidence", []).extend(upd["evidence"])
+            existing = card.setdefault("evidence", [])
+            seen = {_evidence_key(e) for e in existing}
+            for ev in upd.get("evidence") or []:
+                k = _evidence_key(ev)
+                if k not in seen:
+                    existing.append(ev)
+                    seen.add(k)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(card, f, ensure_ascii=False, indent=2)
         changed.append(cid)
@@ -607,9 +636,15 @@ def _cli() -> int:
         changed = apply_updates(args.strategies, agg, dry_run=args.dry_run)
         for cid in changed:
             print(f"{'[dry-run] ' if args.dry_run else ''}合并 {cid}: delta={agg[cid]['delta']:+.3f}")
-        # 消费已合并的更新文件（非 dry-run）
+        missing = missing_card_ids(agg, args.strategies)
+        if missing:
+            print(f"⚠️ 以下 {len(missing)} 张卡不存在，增量未合并、其更新文件已保留：{sorted(missing)}")
+        # 消费已合并的更新文件（非 dry-run）；含缺失卡的更新文件保留，避免静默丢更新
         if not args.dry_run:
+            mset = set(missing)
             for path in sorted(glob.glob(os.path.join(args.results, "*", "knowledge_updates_*.json"))):
+                if _update_file_has_missing(path, mset):
+                    continue
                 os.remove(path)
         return 0
 

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import uuid
@@ -755,6 +756,14 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             })
             best_source_features = feats
             best_applied_cards = applied_cards
+            # P1（3.3）：best 输出矩阵单独落盘，避免被后续失败轮覆盖根目录 cuda_output_*.bin
+            try:
+                if os.path.exists(out_bin):
+                    run_dir = os.path.join(RESULTS_DIR, str(run_id))
+                    os.makedirs(run_dir, exist_ok=True)
+                    shutil.copyfile(out_bin, os.path.join(run_dir, f"{matrix_size}_best.bin"))
+            except Exception as e:
+                print(f"[{matrix_size}] ⚠️ best 输出矩阵落盘失败（不影响评测）：{e}")
             if best["effective_time"] is not None:
                 print(f"[{matrix_size}] ✅ 更新最优：attempt {attempt + 1}，耗时 {best['effective_time']:.6f}s")
             else:

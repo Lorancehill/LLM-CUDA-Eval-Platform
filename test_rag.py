@@ -315,6 +315,44 @@ def test_load_apply_updates_and_promote():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_apply_updates_dedups_evidence_and_backs_up():
+    tmp = tempfile.mkdtemp()
+    try:
+        strategies = os.path.join(tmp, "strategies")
+        os.makedirs(strategies)
+        with open(os.path.join(strategies, "C1.json"), "w") as f:
+            json.dump(make_card("C1", confidence=0.5), f)
+        ev = {"run_id": "r1", "speedup": 2.0}
+        rag.apply_updates(strategies, {"C1": {"delta": 0.05, "evidence": [ev, ev]}})
+        with open(os.path.join(strategies, "C1.json")) as f:
+            merged = json.load(f)
+        # 重复证据只写一次（P1：反复 merge 不重复堆积）
+        assert len(merged["evidence"]) == 1
+        assert merged["evidence"][0]["speedup"] == 2.0
+        # 写卡前已备份（P1：merge 可回滚）
+        assert os.path.exists(os.path.join(strategies, "C1.json.bak"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_missing_card_ids_and_update_file_has_missing():
+    tmp = tempfile.mkdtemp()
+    try:
+        strategies = os.path.join(tmp, "strategies")
+        os.makedirs(strategies)
+        with open(os.path.join(strategies, "C1.json"), "w") as f:
+            json.dump(make_card("C1"), f)
+        assert rag.missing_card_ids({"C1": {}, "GHOST": {}}, strategies) == ["GHOST"]
+
+        upd_path = os.path.join(tmp, "knowledge_updates_16.json")
+        with open(upd_path, "w") as f:
+            json.dump({"run_id": "r1", "updates": {"GHOST": {"delta": 0.05}}}, f)
+        assert rag._update_file_has_missing(upd_path, {"GHOST"}) is True
+        assert rag._update_file_has_missing(upd_path, {"OTHER"}) is False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

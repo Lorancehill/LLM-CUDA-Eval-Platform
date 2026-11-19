@@ -165,8 +165,11 @@ def build_error_feedback(errors, source_context, kind, *, returncode=None,
         )
 
     if kind == "wrong_result":
+        # P1（3.3）：NaN 输出被正确判失败时，max_diff 可能是 NaN，直接格式化会出「nan」。
+        md = sanitize_float(max_diff)
+        diff_txt = f"{md:.6g}" if md is not None else "非有限值（NaN/Inf，结果矩阵含非法数值）"
         return (
-            f"你上次写的代码能运行，但结果矩阵与基准不符（最大绝对误差 {max_diff:.6g}，"
+            f"你上次写的代码能运行，但结果矩阵与基准不符（最大绝对误差 {diff_txt}，"
             f"超过校准容差）。\n请检查矩阵乘法逻辑（索引、累加、边界），修复后重新提供完整的 CUDA 代码。"
         )
 

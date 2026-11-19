@@ -1,7 +1,8 @@
 # 核心依赖：async_eval.py / validate.py / test_api.py
-numpy
-openai
-python-dotenv
+# 版本锁定（P1：确保跨机器可复现；当前以宿主环境实测版本为准）
+numpy==2.5.5
+openai==3.39.0
+python-dotenv==1.2.4
 
 # 可选：仅 baseline_torch.py 需要，且依赖 CUDA GPU
 # torch

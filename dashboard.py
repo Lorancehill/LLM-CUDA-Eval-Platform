@@ -299,8 +299,8 @@ footer{padding:16px 28px;color:var(--muted);font-size:12px}
   </div>
 
   <div class="panel" id="comparePanel" style="display:none">
-    <h2>跨 run 对比（尺寸 × 条件，中位数 + 误差棒）</h2>
-    <div class="hint">同尺寸下不同 run（kb on/off、模型）的耗时对比；误差棒 = min–max；基线 = 首个选中的 run。</div>
+    <h2>跨 run 对比（尺寸 × 条件，最优内核耗时）</h2>
+    <div class="hint">同尺寸下不同 run（kb on/off、模型）的最优内核（best-of-attempts）耗时对比；基线 = 首个选中的 run。</div>
     <canvas id="compareChart"></canvas>
     <div class="legend" id="compareLegend"></div>
     <div id="compareTable" style="margin-top:12px"></div>
@@ -319,7 +319,6 @@ let DATA=null, RUN=null;
 
 function sizeColor(n){if(SIZECOLORS[n])return SIZECOLORS[n];let h=0;for(const c of String(n))h=(h*31+c.charCodeAt(0))>>>0;return SIZE_PALETTE[h%SIZE_PALETTE.length];}
 function runColor(i){return SIZE_PALETTE[i%SIZE_PALETTE.length];}
-function median(a){a=[...a].sort((x,y)=>x-y);const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
 
 function fmtTime(s){
   if(s==null) return "—";
@@ -654,12 +653,13 @@ function runLabel(r){
   return `${r.run_id} · ${cond}${models.length?", "+models.join(","):""}`;
 }
 
-function sizeMedian(r,sz){
+function sizeBest(r,sz){
   const s=r.sizes.find(x=>x.matrix_size===sz);
   if(!s)return null;
-  const ts=[];
-  s.attempts.forEach(a=>{if(a.ok){const t=effTime(a);if(t)ts.push(t);}});
-  return ts.length?median(ts):null;
+  if(s.best_time_sec!=null&&s.best_time_sec>0)return s.best_time_sec;
+  let best=null;
+  s.attempts.forEach(a=>{if(a.ok){const t=effTime(a);if(t&&(best==null||t<best))best=t;}});
+  return best;
 }
 
 function drawCompareChart(runs){
@@ -671,13 +671,10 @@ function drawCompareChart(runs){
   const data={};
   sizes.forEach(sz=>{
     data[sz]=runs.map((r,i)=>{
-      const s=r.sizes.find(x=>x.matrix_size===sz);
-      const ts=[];
-      if(s)s.attempts.forEach(a=>{if(a.ok){const t=effTime(a);if(t)ts.push(t);}});
-      if(!ts.length)return null;
-      const lo=Math.min(...ts),hi=Math.max(...ts),med=median(ts);
-      ys.push(lo,hi);
-      return {runIdx:i,med,lo,hi};
+      const b=sizeBest(r,sz);
+      if(b==null)return null;
+      ys.push(b);
+      return {runIdx:i,b};
     });
   });
   const ylo=ys.length?Math.floor(Math.log10(Math.min(...ys))):-5;
@@ -710,11 +707,7 @@ function drawCompareChart(runs){
     items.forEach((it,k)=>{
       const x=startX+k*barW;
       const col=runColor(it.runIdx);
-      ctx.strokeStyle="#9ca3af";ctx.lineWidth=1;
-      ctx.beginPath();ctx.moveTo(x+barW/2,py(it.lo));ctx.lineTo(x+barW/2,py(it.hi));ctx.stroke();
-      ctx.beginPath();ctx.moveTo(x+barW/2-3,py(it.lo));ctx.lineTo(x+barW/2+3,py(it.lo));ctx.stroke();
-      ctx.beginPath();ctx.moveTo(x+barW/2-3,py(it.hi));ctx.lineTo(x+barW/2+3,py(it.hi));ctx.stroke();
-      const top=py(it.med), ht=bottom-top;
+      const top=py(it.b), ht=bottom-top;
       ctx.fillStyle=col;ctx.globalAlpha=0.85;
       ctx.fillRect(x,top,barW-2,ht);
       ctx.globalAlpha=1;
@@ -728,8 +721,8 @@ function renderCompareTable(runs){
   const base=runs[0];
   const rows=sizes.map(sz=>{
     const cells=runs.map(r=>{
-      const m=sizeMedian(r,sz);
-      const bm=base?sizeMedian(base,sz):null;
+      const m=sizeBest(r,sz);
+      const bm=base?sizeBest(base,sz):null;
       const sp=(m&&bm)?(bm/m):null;
       return `<td class="num">${fmtTime(m)}${sp!=null?`<br><small style="color:var(--muted)">${sp.toFixed(2)}×</small>`:""}</td>`;
     }).join("");

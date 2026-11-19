@@ -21,12 +21,13 @@
   },
   "expected_gain": "2x-10x（相对 naive 全局内存实现）",
   "failure_modes": [
-    "TILE 过大导致 shared memory 溢出（每 SM 上限约 100KB）",
+    "TILE 过大导致 shared memory 溢出（sm_120 每 SM 共享内存 100KB/102400B，单 block 默认 48KB、opt-in 约 99KB）",
     "只分块不复用（K 维仍重复读全局）无收益",
     "漏写 __syncthreads 导致数据竞争"
   ],
   "evidence": [
-    {"source": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations", "note": "shared memory 分块复用减少全局内存访问"}
+    {"source": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations", "note": "shared memory 分块复用减少全局内存访问"},
+    {"source": "deviceQuery (sm_120, RTX 5060 Laptop)", "note": "sharedMemPerMultiprocessor=102400B, sharedMemPerBlock=49152B, sharedMemPerBlockOptin=101376B"}
   ],
   "confidence": 0.6,
   "provenance": "CUDA C Best Practices Guide, Ch.9 Memory Optimizations",

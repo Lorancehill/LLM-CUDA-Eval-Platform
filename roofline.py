@@ -24,6 +24,14 @@ PEAK_BANDWIDTH_GBS = 448.0       # GB/s
 LOW_UTILIZATION = 0.005
 
 
+def _clamp01(x: float) -> float:
+    """把利用率夹到 [0, 1]。自报计时偏快或峰值参数偏保守时，roofline 兜底判据的
+    利用率可能 >100%（如 207%），物理上不可能，落盘/反馈前夹到 1.0（P1）。"""
+    if x < 0.0:
+        return 0.0
+    return 1.0 if x > 1.0 else x
+
+
 def matmul_flops(N: int) -> float:
     """矩阵乘法总 FLOPs = 2*N^3（N*N 输出，每输出 N 次乘加）。"""
     return 2.0 * N * N * N
@@ -127,6 +135,10 @@ def roofline_classify(N: int, time_sec: float | None, code: str | None = None):
     else:
         label = "compute"
 
+    # P1：兜底判据的利用率可能 >100%（自报计时偏快/峰值偏保守），夹到 [0,1] 再落盘/反馈。
+    compute_utilization = _clamp01(compute_utilization)
+    memory_utilization = _clamp01(memory_utilization)
+
     m = {
         "profile_source": "roofline_proxy",
         "timing_source": "self_reported",
@@ -149,8 +161,10 @@ def format_proxy_metrics(m: dict) -> str:
     """把 roofline 指纹格式化为单行可读文本（缺失/空返回说明）。"""
     if not m:
         return "无有效计时，无法做 roofline 指纹。"
+    cu = _clamp01(float(m.get("compute_utilization", 0.0) or 0.0))
+    mu = _clamp01(float(m.get("memory_utilization", 0.0) or 0.0))
     return (
-        f"实测算力 {m['achieved_gflops']:.2f} GFLOP/s（{m['compute_utilization']*100:.2f}%） | "
-        f"实测带宽 {m['achieved_gbs']:.1f} GB/s（{m['memory_utilization']*100:.2f}%） | "
+        f"实测算力 {m['achieved_gflops']:.2f} GFLOP/s（{cu*100:.2f}%） | "
+        f"实测带宽 {m['achieved_gbs']:.1f} GB/s（{mu*100:.2f}%） | "
         f"算术强度 {m['arithmetic_intensity']:.2f} FLOP/byte | 拐点 {m['ridge_point']:.1f} FLOP/byte"
     )

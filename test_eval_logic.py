@@ -121,6 +121,13 @@ def test_build_error_feedback_wrong_result_and_timeout():
     assert "20 秒" in fb2 and "超时" in fb2
 
 
+def test_build_error_feedback_wrong_result_nan_sanitized():
+    # P1（3.3）：NaN 输出被判失败时，反馈不应出现「最大绝对误差 nan」
+    fb = eval_logic.build_error_feedback([], None, "wrong_result", max_diff=float("nan"))
+    assert "最大绝对误差 nan" not in fb
+    assert "非有限值" in fb
+
+
 def test_persist_result_writes_json_and_index():
     tmp = tempfile.mkdtemp()
     try:
