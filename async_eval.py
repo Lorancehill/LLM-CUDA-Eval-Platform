@@ -411,6 +411,7 @@ def _empty_record(out_bin):
         "applied_cards": [],
         "retrieved_card_ids": None,
         "error_feedback": None,
+        "compile_errors": [],
         "compile_stdout_tail": None,
         "compile_stderr_tail": None,
         "timed_out": None,
@@ -418,6 +419,33 @@ def _empty_record(out_bin):
         "model": None,
         "usage": None,
     }
+
+
+def _read_source_context(cu_filename, compile_errors, before=2, after=2):
+    """读出错行附近的 .cu 源码片段（带行号），供自我纠错把出错行喂回模型。
+
+    只取第一条带行号的报错行（line 指 .cu 文件内行号）；读不到文件 / 无行号返回 None，
+    上层兜底只给报错文本。
+    """
+    target = None
+    for e in compile_errors or []:
+        if e.get("line") is not None:
+            target = e["line"]
+            break
+    if target is None:
+        return None
+    try:
+        with open(cu_filename, encoding="utf-8", errors="replace") as f:
+            src = f.readlines()
+    except OSError:
+        return None
+    lo = max(1, target - before)
+    hi = min(len(src), target + after)
+    out = []
+    for n in range(lo, hi + 1):
+        marker = ">>>" if n == target else "   "
+        out.append(f"{marker} {n:4d} | {src[n - 1].rstrip()}")
+    return "\n".join(out)
 
 
 async def evaluate_matrix(matrix_size, run_id, env_snapshot):
@@ -610,38 +638,30 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             print(f"[{matrix_size}] ❌ 第 {attempt + 1} 次评测失败！正在反馈给 AI...")
             messages.append({"role": "assistant", "content": raw_text})
 
-            # 真正的自我纠错：把报错信息截取最后 300 个字符存进变量，喂回 DeepSeek
             err_tail = stderr_str[-300:].strip()
             out_tail = stdout_str[-300:].strip()
             record["compile_stdout_tail"] = out_tail
             record["compile_stderr_tail"] = err_tail
 
+            # 真正的自我纠错：优先结构化编译错误（nvcc/g++/ptxas 行号 + 报错原因）
+            # + 出错行源码上下文，喂回模型；找不到结构化错误时兜底输出尾部 300 字符。
+            compile_errors = eval_logic.extract_compile_errors(stderr_str + "\n" + stdout_str)
+            record["compile_errors"] = compile_errors
+            source_context = _read_source_context(cu_filename, compile_errors)
+
             if timed_out:
-                error_feedback = (
-                    f"你上次的 CUDA 代码在 {TIMEOUT_SECONDS} 秒内未跑完（超时被强杀）。\n"
-                    f"[运行输出尾部]\n{out_tail}\n"
-                    f"[错误输出尾部]\n{err_tail}\n"
-                    f"可能是算法太慢（如 naive 三重循环）或存在死循环，请优化 kernel 后重新提供完整代码。"
-                )
+                kind = "timeout"
             elif returncode is None or returncode != 0:
-                error_feedback = (
-                    f"你的代码在 Docker 沙箱中运行失败（退出码 {returncode}）。\n"
-                    f"[stdout 尾部]\n{out_tail}\n"
-                    f"[stderr 尾部]\n{err_tail}\n"
-                    f"请根据报错信息定位问题，修复后重新提供完整的 CUDA 代码。"
-                )
+                kind = "run_failed"
             elif max_diff is None:
-                error_feedback = (
-                    f"你上次写的代码能编译运行，但没有输出结果矩阵 {out_bin}。\n"
-                    f"[stdout 尾部]\n{out_tail}\n"
-                    f"[stderr 尾部]\n{err_tail}\n"
-                    f"请确认 fwrite 写入了 {out_bin}，修复后重新提供完整的 CUDA 代码。"
-                )
+                kind = "no_output"
             else:
-                error_feedback = (
-                    f"你上次写的代码能运行，但结果矩阵与基准不符（最大绝对误差 {max_diff:.6g}，"
-                    f"超过校准容差）。\n请检查矩阵乘法逻辑（索引、累加、边界），修复后重新提供完整的 CUDA 代码。"
-                )
+                kind = "wrong_result"
+            error_feedback = eval_logic.build_error_feedback(
+                compile_errors, source_context, kind,
+                returncode=returncode, max_diff=max_diff, out_bin=out_bin,
+                timeout=TIMEOUT_SECONDS, stdout_tail=out_tail, stderr_tail=err_tail,
+            )
             record["error_feedback"] = error_feedback
             messages.append({"role": "user", "content": error_feedback})
             # R3：失败轮对上轮注入的卡给负置信度（模型被要求应用但编译/结果失败）

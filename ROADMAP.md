@@ -18,6 +18,16 @@
 2. 真正的“自我纠错”闭环 (Self-Correction)
    · 完善：目前的循环只是简单的重试。进阶为：通过 subprocess 捕获到具体的编译器报错（如 nvcc error 行号），将其自动拼接到新的 Prompt 中喂回大模型。
    · 目的：让系统真正具备“Agent（智能体）”的雏形，不再依赖人工干预。
+   · ✅ 已实现（2026-11-19，不再只给 stderr 尾部 300 字符）：
+     - eval_logic.extract_compile_errors()：从 nvcc / 宿主 g++ / ptxas 三种编译输出里提取
+       结构化报错行（file + 行号 + severity + 报错原因），纯函数离线单测覆盖。
+     - async_eval._read_source_context()：按第一条带行号的报错行，读回该 .cu 文件的出错行
+       附近源码（带行号、>>> 标记出错行），把「具体是哪一行写错了」直接喂给模型。
+     - eval_logic.build_error_feedback()：按失败类别（timeout / run_failed / no_output /
+       wrong_result）拼装纠错反馈；有结构化编译错误时优先用「行号 + 报错原因 + 出错行源码」，
+       否则兜底回落到 stdout/stderr 尾部。results 每轮 record 新增 compile_errors 字段留证。
+     - test_eval_logic.py：新增 6 项单测（nvcc/gcc/ptxas 解析、无匹配、反馈优先结构化/兜底、
+       wrong_result/timeout 文案），全过。
 3. Web 可视化看板 (Streamlit / Gradio)
    · 完善：写一个 50-100 行的 Python 前端。
    · 目的：脱离黑框框，实现网页端输入提示词 -> 点击运行 -> 动态展示折线图和加速比对比。答辩时的绝杀武器。

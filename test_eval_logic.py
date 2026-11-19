@@ -63,6 +63,64 @@ def test_compute_speedup():
     assert eval_logic.compute_speedup("x", 0.5) is None
 
 
+def test_extract_compile_errors_nvcc():
+    err = (
+        "matrix_mul_256.cu(12): error: identifier \"foo\" is undefined\n"
+        "          detected during instantiation of \"void matmul_kernel<float>(...)\"\n"
+        "(24): here\n"
+        "1 error detected in the compilation of \"matrix_mul_256.cu\".\n"
+    )
+    got = eval_logic.extract_compile_errors(err)
+    assert len(got) == 1
+    assert got[0]["file"] == "matrix_mul_256.cu"
+    assert got[0]["line"] == 12
+    assert got[0]["severity"] == "error"
+    assert got[0]["source"] == "nvcc"
+    assert "foo" in got[0]["message"]
+
+
+def test_extract_compile_errors_gcc_and_ptxas():
+    err = (
+        "/tmp/tmpxft_000/main.cu:18:5: error: 'bar' was not declared in this scope\n"
+        "ptxas error   : Entry function '_Z13matmul_kernelPfS_S_i' uses too much shared data\n"
+    )
+    got = eval_logic.extract_compile_errors(err)
+    assert len(got) == 2
+    assert got[0]["source"] == "gcc" and got[0]["line"] == 18 and got[0]["file"] == "/tmp/tmpxft_000/main.cu"
+    assert got[1]["source"] == "ptxas" and got[1]["line"] is None and "shared" in got[1]["message"]
+
+
+def test_extract_compile_errors_no_match():
+    assert eval_logic.extract_compile_errors("") == []
+    assert eval_logic.extract_compile_errors("Time: 0.5 seconds\nnormal output") == []
+
+
+def test_build_error_feedback_prefers_compile_errors():
+    errors = eval_logic.extract_compile_errors(
+        "matrix_mul_256.cu(12): error: identifier \"foo\" is undefined"
+    )
+    ctx = ">>>   12 | int foo = x;\n      13 | "
+    fb = eval_logic.build_error_feedback(errors, ctx, "run_failed", returncode=1,
+                                         stdout_tail="tail-out", stderr_tail="tail-err")
+    assert "matrix_mul_256.cu:12" in fb          # 具体行号喂回模型
+    assert "foo" in fb
+    assert "出错行附近的源码" in fb
+    assert "tail-err" not in fb                  # 有结构化错误时不再兜底尾部
+
+
+def test_build_error_feedback_fallback_to_tail():
+    fb = eval_logic.build_error_feedback([], None, "run_failed", returncode=2,
+                                         stdout_tail="out", stderr_tail="err")
+    assert "err" in fb and "退出码 2" in fb
+
+
+def test_build_error_feedback_wrong_result_and_timeout():
+    fb = eval_logic.build_error_feedback([], None, "wrong_result", max_diff=1.5)
+    assert "1.5" in fb and "容差" in fb
+    fb2 = eval_logic.build_error_feedback([], None, "timeout", timeout=20)
+    assert "20 秒" in fb2 and "超时" in fb2
+
+
 def test_persist_result_writes_json_and_index():
     tmp = tempfile.mkdtemp()
     try:

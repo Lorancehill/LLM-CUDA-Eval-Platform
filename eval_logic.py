@@ -13,6 +13,20 @@ import re
 
 _TIME_RE = re.compile(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
 
+# 编译器报错行（自我纠错闭环用，见 extract_compile_errors）。
+# ① nvcc：matrix_mul_256.cu(12): error: identifier "foo" is undefined
+# ② 宿主 g++：/tmp/.../main.cu:12:5: error: 'foo' was not declared in this scope
+# ③ ptxas（编译期、无行号）：ptxas error   : Entry function ... uses too much shared data
+_NVCC_ERR_RE = re.compile(
+    r"(?P<file>[^\s(),:]+)?\s*\((?P<line>\d+)\):\s*(?P<sev>error|warning|note):\s*(?P<msg>.*)"
+)
+_GCC_ERR_RE = re.compile(
+    r"(?P<file>[^\s():,]+):(?P<line>\d+)(?::\d+)?:\s*(?P<sev>fatal error|error|warning|note):\s*(?P<msg>.*)"
+)
+_PTXAS_ERR_RE = re.compile(
+    r"\bptxas\s+(?P<sev>fatal|error|warning)\s*:\s*(?P<msg>.*)"
+)
+
 
 def parse_time_seconds(stdout_str: str) -> float | None:
     """从 CUDA 输出解析 'Time: xxx seconds' 中的秒数；无匹配返回 None。"""
@@ -69,6 +83,107 @@ def compute_speedup(prev_time, cur_time) -> float | None:
     if p <= 0 or c <= 0:
         return None
     return p / c
+
+
+def extract_compile_errors(text: str) -> list[dict]:
+    """从 nvcc / g++ / ptxas 编译输出里提取结构化报错行（file/line/severity/message）。
+
+    自我纠错闭环用：把「具体行号 + 报错原因」喂回模型，而不是只给 stderr 尾部 300 字符。
+    覆盖三种形态（示例见 _NVCC_ERR_RE / _GCC_ERR_RE / _PTXAS_ERR_RE）：
+    - nvcc：``matrix_mul_256.cu(12): error: identifier "foo" is undefined``
+    - 宿主 g++：``/tmp/.../main.cu:12:5: error: 'foo' was not declared``
+    - ptxas（编译期、无行号）：``ptxas error : Entry function ... uses too much shared data``
+    无匹配返回空列表。
+    """
+    out = []
+    for m in _NVCC_ERR_RE.finditer(text or ""):
+        out.append({
+            "file": m.group("file") or None,
+            "line": int(m.group("line")),
+            "severity": m.group("sev"),
+            "message": (m.group("msg") or "").strip(),
+            "source": "nvcc",
+        })
+    for m in _GCC_ERR_RE.finditer(text or ""):
+        out.append({
+            "file": m.group("file") or None,
+            "line": int(m.group("line")),
+            "severity": m.group("sev"),
+            "message": (m.group("msg") or "").strip(),
+            "source": "gcc",
+        })
+    for m in _PTXAS_ERR_RE.finditer(text or ""):
+        out.append({
+            "file": None,
+            "line": None,
+            "severity": m.group("sev"),
+            "message": (m.group("msg") or "").strip(),
+            "source": "ptxas",
+        })
+    return out
+
+
+def build_error_feedback(errors, source_context, kind, *, returncode=None,
+                         max_diff=None, out_bin=None, timeout=None,
+                         stdout_tail="", stderr_tail=""):
+    """按失败类别拼装自我纠错反馈（纯函数，供闭环把报错喂回模型）。
+
+    - errors：extract_compile_errors 的结构化列表（可为空）。
+    - source_context：出错行附近的 .cu 源码片段（可 None，由上层读文件传入）。
+    - kind：timeout / run_failed / no_output / wrong_result。
+    有结构化编译错误时，优先用「行号 + 报错原因 + 出错行源码」；
+    否则回落到 stdout/stderr 尾部（兜底，避免空反馈）。
+    """
+    def _compile_block():
+        if not errors:
+            return ""
+        lines = ["编译器报错如下："]
+        for e in errors[:5]:  # 只喂前 5 条，避免超长稀释关键信息
+            loc = e.get("file") or "你的 .cu 文件"
+            if e.get("line") is not None:
+                loc = f"{loc}:{e['line']}"
+            lines.append(f"  - {loc} [{e['severity']}] {e['message']}")
+        block = "\n".join(lines)
+        if source_context:
+            block += "\n\n出错行附近的源码：\n" + source_context
+        return block
+
+    if kind == "timeout":
+        return (
+            f"你上次的 CUDA 代码在 {timeout} 秒内未跑完（超时被强杀）。\n"
+            f"[运行输出尾部]\n{stdout_tail}\n"
+            f"[错误输出尾部]\n{stderr_tail}\n"
+            f"可能是算法太慢（如 naive 三重循环）或存在死循环，请优化 kernel 后重新提供完整代码。"
+        )
+
+    if kind == "no_output":
+        return (
+            f"你上次写的代码能编译运行，但没有输出结果矩阵 {out_bin}。\n"
+            f"[stdout 尾部]\n{stdout_tail}\n"
+            f"[stderr 尾部]\n{stderr_tail}\n"
+            f"请确认 fwrite 写入了 {out_bin}，修复后重新提供完整的 CUDA 代码。"
+        )
+
+    if kind == "wrong_result":
+        return (
+            f"你上次写的代码能运行，但结果矩阵与基准不符（最大绝对误差 {max_diff:.6g}，"
+            f"超过校准容差）。\n请检查矩阵乘法逻辑（索引、累加、边界），修复后重新提供完整的 CUDA 代码。"
+        )
+
+    # run_failed：编译/运行失败，优先结构化编译错误，否则兜底尾部
+    compile_block = _compile_block()
+    if compile_block:
+        return (
+            f"你的代码在 Docker 沙箱中编译/运行失败（退出码 {returncode}）。\n"
+            f"{compile_block}\n"
+            f"请根据上面的行号和报错信息定位并修复，重新提供完整的 CUDA 代码。"
+        )
+    return (
+        f"你的代码在 Docker 沙箱中运行失败（退出码 {returncode}）。\n"
+        f"[stdout 尾部]\n{stdout_tail}\n"
+        f"[stderr 尾部]\n{stderr_tail}\n"
+        f"请根据报错信息定位问题，修复后重新提供完整的 CUDA 代码。"
+    )
 
 
 def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_version,
