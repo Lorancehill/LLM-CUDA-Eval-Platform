@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 
@@ -48,8 +49,9 @@ PULL_RETRIES = 3
 # 画像/分类/反馈证据链落盘目录（运行时产物，已在 .gitignore 忽略）
 RESULTS_DIR = "results"
 
-# 配置的 API 模型别名；真实服务模型以 response.model 为准，逐轮落盘
-MODEL_NAME = "deepseek-chat"
+# 配置的 API 模型别名；真实服务模型以 response.model 为准，逐轮落盘。
+# 可用 MODEL 环境变量覆盖（P0-1：批跑脚本按 run 注入不同模型）。
+MODEL_NAME = os.getenv("MODEL", "deepseek-chat") or "deepseek-chat"
 PROMPT_VERSION = "matmul_v1"
 
 # 目标内核名 demangled 正则（模型生成的 matmul 内核常见命名）。
@@ -274,6 +276,42 @@ def probe_host_ncu():
     return False, f"ncu 已安装但不认识 gb206（--list-chips 无 gb206，需升级；当前用 {ncu_bin}）"
 
 
+def collect_experiment_meta():
+    """从环境变量读取实验元数据（周末批跑的消融标签，P0-1）。
+
+    - EXPERIMENT_ID / CONDITION / REPEAT：由 run_experiment.py 以子进程环境注入；
+    - MODEL_NAME：本次运行配置的模型别名（由 MODEL 环境变量解析）。
+    未设置时返回 None，便于区分「独立运行」与「批跑条件 run」。
+    """
+    return {
+        "EXPERIMENT_ID": os.getenv("EXPERIMENT_ID"),
+        "CONDITION": os.getenv("CONDITION"),
+        "REPEAT": os.getenv("REPEAT"),
+        "MODEL_NAME": MODEL_NAME,
+    }
+
+
+def _git_snapshot():
+    """记录代码版本（论文可复现底线，P0-2）：git_commit=HEAD，git_dirty=工作区是否干净。
+
+    任一步失败只记 None；git_dirty 仅在 git status 成功执行时有意义（False=干净）。
+    """
+    snap = {"git_commit": None, "git_dirty": None}
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, timeout=10, text=True)
+        if r.returncode == 0:
+            snap["git_commit"] = r.stdout.strip() or None
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], capture_output=True, timeout=10, text=True)
+        if r.returncode == 0:
+            snap["git_dirty"] = bool(r.stdout.strip())
+    except Exception:
+        pass
+    return snap
+
+
 def collect_env_snapshot():
     """收集环境快照（GPU/驱动/ncu/镜像/依赖版本），供论文复现；任一步失败只记 unavailable。"""
     import platform
@@ -312,6 +350,9 @@ def collect_env_snapshot():
     snap["cuda_image"] = _run(
         ["docker", "image", "inspect", CUDA_IMAGE, "--format", "{{.Id}}"]
     ) or "unavailable"
+    # 实验元数据（P0-1）+ 代码版本（P0-2），供消融对比与论文复现
+    snap.update(collect_experiment_meta())
+    snap.update(_git_snapshot())
     return snap
 
 
@@ -831,12 +872,15 @@ async def main():
     print("================ 开始并发评测 ================")
     if not await ensure_image():
         print("================ 沙箱镜像不可用，评测中止 ================")
-        return
+        return 1
 
     ncu_ok, ncu_msg = probe_host_ncu()
     print(f"[ncu] 宿主探测：{ncu_msg}")
 
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    # run_id 可由 RUN_ID 环境变量覆盖（P0-3：批跑脚本按 run 注入确定性 id，便于归档）
+    run_id = os.getenv("RUN_ID") or (
+        datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    )
     env_snapshot = collect_env_snapshot()
     print(f"[run] run_id={run_id}")
 
@@ -872,6 +916,14 @@ async def main():
     print("==============================================================")
     print("================ 评测全部结束 ================")
 
+    # 任何尺寸异常/失败都记为整批失败，供批跑脚本按退出码重试（P0-3）
+    all_ok = True
+    for res in results:
+        if isinstance(res, Exception) or not (res and res[0]):
+            all_ok = False
+            break
+    return 0 if all_ok else 1
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()) or 0)

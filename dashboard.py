@@ -72,10 +72,14 @@ def _size_entry_from_full(full: dict, size) -> dict:
         if best_ncu is not None:
             timing_source = "self"
     knowledge = (full or {}).get("knowledge") or {}
+    env = (full or {}).get("env") or {}
     return {
         "matrix_size": size,
         "model": (full or {}).get("model"),
         "prompt_version": (full or {}).get("prompt_version"),
+        "condition": env.get("CONDITION"),
+        "experiment_id": env.get("EXPERIMENT_ID"),
+        "repeat": env.get("REPEAT"),
         "success": bool((full or {}).get("success")),
         "best_attempt": best.get("attempt"),
         "best_time_sec": best_ncu,
@@ -342,10 +346,12 @@ async function load(){
   cmp.innerHTML="";
   DATA.runs.forEach((run,i)=>{
     const sizes=run.sizes.map(s=>s.matrix_size).join("/");
+    const conds=[...new Set(run.sizes.map(s=>s.condition).filter(Boolean))];
     const kb=run.sizes.some(s=>s.knowledge_enabled)?"kb=on":"kb=off";
+    const cond=conds.length?conds.join(","):kb;
     const o=document.createElement("option");
     o.value=i;
-    o.textContent=`${run.run_id} · ${sizes} · ${kb} · ${(run.timestamp||"").replace("T"," ").slice(0,19)}`;
+    o.textContent=`${run.run_id} · ${sizes} · ${cond} · ${(run.timestamp||"").replace("T"," ").slice(0,19)}`;
     sel.appendChild(o);
     cmp.appendChild(o.cloneNode(true));
   });
@@ -639,9 +645,11 @@ function renderKnowledge(sizes){
 }
 
 function runLabel(r){
+  const conds=[...new Set(r.sizes.map(s=>s.condition).filter(Boolean))];
   const kb=r.sizes.some(s=>s.knowledge_enabled)?"kb=on":"kb=off";
   const models=[...new Set(r.sizes.map(s=>s.model).filter(Boolean))];
-  return `${r.run_id} · ${kb}${models.length?", "+models.join(","):""}`;
+  const cond=conds.length?conds.join(","):kb;
+  return `${r.run_id} · ${cond}${models.length?", "+models.join(","):""}`;
 }
 
 function sizeMedian(r,sz){
