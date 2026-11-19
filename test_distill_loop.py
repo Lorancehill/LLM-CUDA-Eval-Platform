@@ -306,6 +306,9 @@ def test_concurrent_sizes_write_distinct_update_files():
         _restore(saved, old_cwd)
 
         # 尺寸 32：同一 run_id、同样第二轮应用 TILING → 写 knowledge_updates_32.json
+        # 注意：_restore 会把 cwd 还原成仓库根目录，必须重新 chdir(tmp)，否则
+        # matrix_mul_32_attempt*.cu / cuda_output_32.bin 会污染仓库根目录。
+        os.chdir(tmp)
         saved = _setup(
             tmp,
             responses=[
