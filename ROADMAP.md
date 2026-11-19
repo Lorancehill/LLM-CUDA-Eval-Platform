@@ -13,6 +13,16 @@
 3. Web 可视化看板 (Streamlit / Gradio)
    · 完善：写一个 50-100 行的 Python 前端。
    · 目的：脱离黑框框，实现网页端输入提示词 -> 点击运行 -> 动态展示折线图和加速比对比。答辩时的绝杀武器。
+   · ✅ 已实现（2026-11-19，零新依赖，纯标准库 http.server + 内嵌 HTML/Canvas，不引 Streamlit/Gradio）：
+     - dashboard.py：读取 results/index.jsonl + results/{run_id}/{size}.json（schema v2），
+       按 run 聚合为 `/api/data` JSON；`python dashboard.py` 即启（默认 http://127.0.0.1:8000）。
+     - 看板内容：环境快照卡 + 汇总卡（尺寸/成功率/总轮次/最佳可信耗时/知识库注入）、
+       「轮次→可信耗时(ncu kernel-only)」对数折线图（点色=瓶颈分类）、
+       相对首轮加速比折线图、ncu 四指标(SM/DRAM/占用率/L2)分轮柱状图、逐轮明细表。
+     - 可信计时口径统一用 ncu_time_sec（与论文口径一致），自报 Time 仅作对照列；NaN/损坏索引行安全降级。
+     - test_dashboard.py：4 项离线单测全过（聚合排序、NaN 净化、空目录、损坏索引行容错）。
+     - 说明：原计划 Streamlit/Gradio 会引入较重依赖，与 rag.py「零依赖」路线冲突，故用 stdlib 等价实现；
+       若后续要网页端直接发评测请求，再在 dashboard.py 加一个 `/api/run` 触发 async_eval（见阶段二 Auto-tuning）。
 4. 完善防作弊与哈希校验
    · 完善：在 Python 侧用纯 C 跑出基准结果，生成 MD5 哈希值。将沙箱里 GPU 跑出的结果也转为哈希值，绝对比对。
    · 目的：防止大模型“背诵”答案，确保 100% 的真实性。
