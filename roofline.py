@@ -12,11 +12,15 @@ memory / compute / latency 三类瓶颈并生成优化反馈。
 
 from __future__ import annotations
 
-# ---- GB206 / RTX 5060 峰值参数（需按实际卡标定）----
-# FP32 峰值：3840 CUDA core × 2 (FMA) × ~2.52 GHz ≈ 19.4 TFLOPS
-PEAK_FLOPS_FP32 = 19.4e12        # FLOP/s
-# 显存带宽：8GB GDDR7 / 128-bit / 28 Gbps ≈ 448 GB/s
-PEAK_BANDWIDTH_GBS = 448.0       # GB/s
+# ---- RTX 5060 Laptop / GB206（sm_120）峰值参数 ----
+# 来源：容器内 deviceQuery（CUDA 12.8, sm_120）实测 + 规格推算，勿再用桌面 5060 的数值。
+#   deviceQuery: multiProcessorCount=26, clockRate=1687000kHz(默认/基频), warpSize=32,
+#                memoryClockRate=12001000kHz, memoryBusWidth=128, sharedMemPerMultiprocessor=102400B
+#   FP32 峰值 ≈ 26 SM × 128 FP32 core/SM × 2 (FMA) × 1.687 GHz ≈ 11.2 TFLOPS（基频保守值）
+#   显存带宽 ≈ 12001 MHz × 2 (DDR) × 128-bit / 8 ≈ 384 GB/s
+# 如需更精确，可锁频后用纯 FMA kernel / copy kernel 实测峰值并替换这两个常数。
+PEAK_FLOPS_FP32 = 11.2e12        # FLOP/s（deviceQuery 基频推算）
+PEAK_BANDWIDTH_GBS = 384.0       # GB/s（deviceQuery 显存频率推算）
 
 # 算力/带宽利用率都低于此值才判 latency（并行度不足，未触及任何上限）。
 # 值取得很低（0.5%）：小尺寸 matmul 相对峰值的绝对利用率天然很低，阈值过高会把

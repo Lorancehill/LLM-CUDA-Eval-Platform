@@ -65,6 +65,12 @@ def test_roofline_clamps_utilization_at_100():
     assert "100.00%" in roofline.format_proxy_metrics(m)
 
 
+def test_roofline_peaks_calibrated_for_rtx5060_laptop():
+    # P1：桌面 5060 的 19.4 TFLOPS / 448 GB/s 不适配 Laptop（26 SM/1.687GHz/12GHz 128bit）
+    assert 10.5e12 <= roofline.PEAK_FLOPS_FP32 <= 12.0e12
+    assert 370.0 <= roofline.PEAK_BANDWIDTH_GBS <= 400.0
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

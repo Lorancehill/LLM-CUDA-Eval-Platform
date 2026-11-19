@@ -75,4 +75,4 @@ python -m compileall .
 
 - `ROADMAP.md`：技术路线与阶段计划
 - `NOTES.md`：科研愿景（MVP → 顶会）
-- 设计与评审文档：见 `改进反馈/` 目录（评估报告、RAG 设计、profiler 评审等）
+- 设计与评审记录：见 `ROADMAP.md` 与 git 提交历史；如需归档，可把评估/评审文档放进 `改进反馈/` 目录

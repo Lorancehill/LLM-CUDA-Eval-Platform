@@ -28,3 +28,7 @@ experiments/
 
 # R3 自蒸馏候选卡（运行时产物，人工 review 后合并进 strategies/）
 knowledge/candidates/
+
+# rag.py merge 前的策略卡备份（运行时产物）
+knowledge/strategies/*.bak
+knowledge/.backup/
