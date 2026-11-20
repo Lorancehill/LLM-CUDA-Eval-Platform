@@ -3,11 +3,13 @@
 
 检查项：
   1. .env 里的 DEEPSEEK_API_KEY
-  2. GPU 可用（nvidia-smi）
-  3. ncu 版本（默认需 2026.4.0）且认识 gb206
-  4. Docker 沙箱镜像已缓存
-  5. 磁盘剩余空间
-  6. 全部离线单测通过
+  2. AsyncOpenAI client 可构造（惰性构造后，代理/socks 配置错误只有真正调用 API
+     时才暴露；预检提前构造一次，避免整批 run 因 ImportError 全废）
+  3. GPU 可用（nvidia-smi）
+  4. ncu 版本（默认需 2026.4.0）且认识 gb206
+  5. Docker 沙箱镜像已缓存
+  6. 磁盘剩余空间
+  7. 全部离线单测通过
 
 用法：
     python preflight.py                 # 全部检查，任一失败退出码 1
@@ -49,6 +51,22 @@ def check_dotenv() -> tuple[bool, str, str]:
     if key.strip():
         return True, f"DEEPSEEK_API_KEY 已设置（长度 {len(key.strip())}）", ""
     return False, "DEEPSEEK_API_KEY 缺失或为空", "在项目根 .env 里设置 DEEPSEEK_API_KEY=sk-xxx"
+
+
+def check_api_client() -> tuple[bool, str, str]:
+    """构造 AsyncOpenAI client（不发起网络请求），提前暴露代理/依赖配置错误。
+
+    P1：client 改为首次调用 API 时才构造后，import async_eval 不再崩溃；但也意味着
+    代理配置错误（如 socks5 缺 socksio）只有整批开跑后才暴露，预检必须补这一项。
+    """
+    try:
+        import async_eval
+        client = async_eval._get_client()
+    except Exception as e:
+        return False, f"API client 构造失败：{type(e).__name__}: {e}", (
+            "检查代理环境变量（http_proxy/https_proxy/ALL_PROXY）；SOCKS 代理需 socksio，"
+            "执行 pip install -r requirements.txt")
+    return True, f"API client 可构造（{type(client).__name__}）", ""
 
 
 def check_gpu() -> tuple[bool, str, str]:
@@ -152,6 +170,7 @@ def main() -> int:
 
     checks = [
         (".env 密钥", check_dotenv()),
+        ("API client", check_api_client()),
         ("GPU", check_gpu()),
         ("ncu", check_ncu(args.ncu_version)),
         ("Docker 镜像", check_docker_image()),
