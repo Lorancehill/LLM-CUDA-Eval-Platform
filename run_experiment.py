@@ -323,7 +323,6 @@ def main() -> int:
 
     # 汇总表（控制台）
     print("\n========== 汇总 ==========")
-    hdr = ["condition", "repeat", "status", "n_ok", "best(s)"]
     for r in rows:
         bests = " | ".join(_fmt_sec(r.get(f"best_{s}_sec")) for s in cells[0]["sizes"])
         print(f"  {r['condition']:<8} r{r['repeat']}  {r['status']:<8} "

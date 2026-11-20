@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 import re
 import shutil
@@ -188,7 +187,7 @@ def unroll_pragma(u: str) -> str:
 def block_grid(family: str, tile: int, n: int) -> tuple[str, str, int]:
     """返回 (block 表达式, grid 表达式, 线程数)。"""
     if family == "naive":
-        return "dim3(16, 16)", f"dim3((N + 15) / 16, (N + 15) / 16)", 256
+        return "dim3(16, 16)", "dim3((N + 15) / 16, (N + 15) / 16)", 256
     if family == "tiled1":
         return f"dim3({tile}, {tile})", f"dim3(N / {tile}, N / {tile})", tile * tile
     if family == "tiled2":
@@ -348,7 +347,6 @@ def run_selftime(v: dict) -> tuple[float | None, str]:
 
 def check_correctness(n: int, work: str) -> tuple[bool, float | None, str]:
     """用仓库 validate.py 的 float64 参考 + 校准容差检查输出矩阵。"""
-    import numpy as np
     sys.path.insert(0, HERE)
     import validate
     path = os.path.join(work, f"cuda_output_{n}.bin")

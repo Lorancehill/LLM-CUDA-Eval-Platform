@@ -64,7 +64,7 @@ def check_ncu(expected_version: str) -> tuple[bool, str, str]:
     except Exception as e:
         return False, f"无法导入 async_eval（{e}）", "确认依赖已安装（numpy/openai/python-dotenv）"
     ncu_bin = async_eval.get_ncu_bin()
-    rc, out, err = _run([ncu_bin, "--version"])
+    _, out, err = _run([ncu_bin, "--version"])
     ver_ok = expected_version in (out + err)
     gb206_ok = async_eval.ncu_supports_gb206()
     if ver_ok and gb206_ok:

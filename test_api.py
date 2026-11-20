@@ -26,9 +26,9 @@ messages = [
 max_retries = 3  # 最多尝试 3 次（防止死循环）
 
 for attempt in range(max_retries):
-    print(f"\n==========================================")
+    print("\n==========================================")
     print(f"🚀 开始第 {attempt + 1} 次生成与评测...")
-    print(f"==========================================")
+    print("==========================================")
 
     response = client.chat.completions.create(
         model="deepseek-chat",

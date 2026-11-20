@@ -397,7 +397,7 @@ async def _profile_kernel(matrix_size, binary, kernel_name=None):
     cmd_list = shlex.split(profiler.build_ncu_cmd(binary, kernel_name, ncu_bin=get_ncu_bin()))
     async with gpu_sem:
         try:
-            _, stdout, stderr, timed_out = await _run_host(cmd_list, NCU_TIMEOUT_SECONDS)
+            _, stdout, stderr, _ = await _run_host(cmd_list, NCU_TIMEOUT_SECONDS)
         except Exception as e:
             print(f"[{matrix_size}] ⚠️ ncu 画像失败（宿主异常）: {e}")
             return None
@@ -954,7 +954,7 @@ async def main():
         print("================ 沙箱镜像不可用，评测中止 ================")
         return 1
 
-    ncu_ok, ncu_msg = probe_host_ncu()
+    _, ncu_msg = probe_host_ncu()
     print(f"[ncu] 宿主探测：{ncu_msg}")
 
     # run_id 可由 RUN_ID 环境变量覆盖（P0-3：批跑脚本按 run 注入确定性 id，便于归档）
