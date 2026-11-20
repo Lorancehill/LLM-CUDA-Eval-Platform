@@ -3,6 +3,9 @@
 numpy==2.5.5
 openai==3.39.0
 python-dotenv==1.2.4
+# SOCKS 代理支持：openai 依赖 httpx2（不含 socks extra）。宿主若设置
+# ALL_PROXY=socks5://... 而无此包，AsyncOpenAI 构造阶段即 ImportError 崩溃。
+socksio==1.0.0
 
 # 可选：仅 baseline_torch.py 需要，且依赖 CUDA GPU
 # torch
