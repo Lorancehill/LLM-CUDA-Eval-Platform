@@ -33,7 +33,16 @@ TIMEOUT_SECONDS = 20
 # ncu 画像超时上限（秒）：ncu 需多次 replay kernel 采集全部指标，比普通运行慢得多
 NCU_TIMEOUT_SECONDS = 120
 # 内核计时重复次数（论文计时口径 3.1.4：跑 N 次取中位数，抗首轮冷启动/偶发抖动）
-TIMING_REPEATS = int(os.getenv("TIMING_REPEATS", "5") or "5")
+def _env_int(name: str, default: int) -> int:
+    """读取正整数环境变量；缺失/非法/<=0 时回退默认值（坏环境变量不应让整批评测崩溃）。"""
+    try:
+        v = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+TIMING_REPEATS = _env_int("TIMING_REPEATS", 5)
 # API 调用超时 / 重试次数（B6：一次 API 抖动不应毁掉整批）
 API_TIMEOUT_SECONDS = 60
 API_RETRIES = 3
@@ -57,7 +66,7 @@ PROMPT_VERSION = "matmul_v1"
 
 # 目标内核名 demangled 正则（模型生成的 matmul 内核常见命名）。
 # 多 kernel 代码里用 --kernel-name 过滤，避免误采 init/融合算子等第一个 launch。
-MATMUL_KERNEL_REGEX = r"(matmul|matMul|matrixMul|mat_mul|matrix_mul|sgemm|gemm)"
+MATMUL_KERNEL_REGEX = r"(matmul|matMul|MatMul|Matmul|matrixMul|matrix_mul|sgemm|gemm|GEMM)"
 
 # RAG 策略卡目录（RAG 设计 §1：knowledge/strategies/*.json）。
 # 用 rag.DEFAULT_STRATEGY_DIR（基于 __file__ 的绝对路径），避免 cwd 依赖（P0-1）。
@@ -77,7 +86,7 @@ def _knowledge_config():
     """
     return {
         "enabled": os.getenv("KNOWLEDGE_ENABLED", "0") in ("1", "true", "True", "yes", "on"),
-        "top_k": int(os.getenv("KNOWLEDGE_TOPK", "3") or "3"),
+        "top_k": _env_int("KNOWLEDGE_TOPK", 3),
         "mode": "cards",
     }
 
@@ -207,6 +216,12 @@ async def ensure_image():
                 continue
             print(f"[镜像] ❌ 多次超时。请手动执行：docker pull {CUDA_IMAGE}")
             return False
+        except Exception as e:
+            # docker 不存在 / 守护进程未启动等：优雅返回 False，而不是让异常穿透整个评测
+            print(f"[镜像] ⚠️ 拉取异常：{e}")
+            if attempt < PULL_RETRIES:
+                continue
+            return False
         if r.returncode == 0:
             print("[镜像] ✅ 拉取完成。")
             return True
@@ -245,20 +260,25 @@ def _resolve_ncu() -> tuple[str, bool]:
     return (candidates[0] if candidates else "ncu"), False
 
 
+def _detect_ncu_once() -> tuple[str, bool]:
+    """只探测一次 ncu，get_ncu_bin / ncu_supports_gb206 共享结果。
+
+    否则两个函数各自调用 _resolve_ncu()，会把 --list-chips 子进程跑两遍。
+    """
+    global _ncu_bin_cache, _ncu_gb206_cache
+    if _ncu_bin_cache is None:
+        _ncu_bin_cache, _ncu_gb206_cache = _resolve_ncu()
+    return _ncu_bin_cache, bool(_ncu_gb206_cache)
+
+
 def get_ncu_bin() -> str:
     """返回本次运行要用的 ncu 二进制路径（懒加载 + 缓存，全进程只探测一次）。"""
-    global _ncu_bin_cache
-    if _ncu_bin_cache is None:
-        _ncu_bin_cache, _ = _resolve_ncu()
-    return _ncu_bin_cache
+    return _detect_ncu_once()[0]
 
 
 def ncu_supports_gb206() -> bool:
-    """本次运行采用的 ncu 是否认识 gb206（懒加载 + 缓存，与 get_ncu_bin 共享探测）。"""
-    global _ncu_gb206_cache
-    if _ncu_gb206_cache is None:
-        _, _ncu_gb206_cache = _resolve_ncu()
-    return _ncu_gb206_cache
+    """本次运行采用的 ncu 是否认识 gb206（与 get_ncu_bin 共享同一次探测）。"""
+    return _detect_ncu_once()[1]
 
 
 def probe_host_ncu():
@@ -561,13 +581,31 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             print(f"[{matrix_size}] ❌ 第 {attempt + 1} 次 API 调用失败，跳过本轮。")
             continue
 
-        raw_text = response.choices[0].message.content or ""
+        choices = getattr(response, "choices", None) or []
+        if not choices or not getattr(choices[0].message, "content", None):
+            record = _empty_record(out_bin)
+            record.update({
+                "attempt": attempt + 1,
+                "error_feedback": "API 返回空内容（choices 为空或 content 为空）",
+            })
+            records.append(record)
+            print(f"[{matrix_size}] ❌ 第 {attempt + 1} 次 API 返回空内容，跳过本轮。")
+            continue
+        raw_text = choices[0].message.content or ""
         model = getattr(response, "model", MODEL_NAME)
 
-        # 正则清洗
-        pattern = r'```(?:cpp|c\+\+|c)?\s*(.*?)\s*```'
-        match = re.search(pattern, raw_text, re.DOTALL)
-        pure_code = match.group(1) if match else raw_text
+        # 正则清洗：先取第一个 ``` 围栏内的内容，再只剥掉「已知语言标签 + 换行」，
+        # 避免把代码首 token（如 __global__）误当语言标签吃掉。
+        fence = re.search(r"```(.*?)```", raw_text, re.DOTALL)
+        if fence:
+            pure_code = fence.group(1).strip("\n")
+            pure_code = re.sub(
+                r"^[ \t]*(?:cpp|CPP|c\+\+|C\+\+|cuda|CUDA|cu|CU|c|C)[ \t]*\r?\n",
+                "", pure_code,
+            )
+            pure_code = pure_code.strip()
+        else:
+            pure_code = raw_text
 
         # 每轮用独立文件名（attempt 后缀）：避免同名覆盖前面正确且更快的内核源码/二进制
         cu_filename = f"matrix_mul_{matrix_size}_attempt{attempt + 1}.cu"
@@ -688,8 +726,10 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             metrics = profile
             print(f"[{matrix_size}] 📊 ncu 硬件画像：\n{profiler.format_metrics(profile)}")
             label, feedback = profiler.classify_bottleneck(profile)
-            if profile.get("gpu__time_duration.sum") is not None:
-                ncu_time_sec = profile["gpu__time_duration.sum"] / 1e9
+            raw_ncu_ns = profile.get("gpu__time_duration.sum")
+            # 0/负值视为无效（指标缺失或解析异常），避免 best_time=0 污染保优与加速比
+            if raw_ncu_ns is not None and raw_ncu_ns > 0:
+                ncu_time_sec = raw_ncu_ns / 1e9
                 print(f"[{matrix_size}] ⏱️  ncu 可信计时 {ncu_time_sec:.6f}s（自报 {time_sec if time_sec is not None else 'N/A'}s）")
         else:
             # 降级：roofline proxy（不依赖 ncu，今天即可端到端跑通）
@@ -718,9 +758,11 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
             applied_cards = rag.infer_applied_cards(prev_retrieved, prev_feats, feats, cards)
         record["applied_cards"] = applied_cards
 
-        # 置信度增量：应用卡按本轮是否更快给 +/-0.05（speedup>1 视为 improved）
+        # 置信度增量：应用卡按本轮是否更快给 +/-0.05（speedup>1 视为 improved）。
+        # speedup 无法计算（上一轮无计时）时不做任何置信度更新，避免把「无法比较」
+        # 误判成「变慢」而扣分。
         improved = record["speedup_vs_prev"] is not None and record["speedup_vs_prev"] > 1.0
-        if applied_cards:
+        if applied_cards and record["speedup_vs_prev"] is not None:
             accumulate_confidence(applied_cards, improved, attempt + 1, applied=True,
                                   speedup=record["speedup_vs_prev"])
 
@@ -897,7 +939,15 @@ async def evaluate_matrix(matrix_size, run_id, env_snapshot):
 async def main():
     # 尺寸由 SIZES 环境变量控制（逗号分隔，缺省 256,512,1024）。
     # P1：run_experiment 注入 SIZES，保证 smoke/分段实验只跑指定尺寸，不再写死三尺寸。
-    sizes = [int(x) for x in os.getenv("SIZES", "256,512,1024").split(",") if x.strip()]
+    try:
+        sizes = [int(x) for x in os.getenv("SIZES", "256,512,1024").split(",") if x.strip()]
+    except ValueError:
+        print("[启动] ❌ SIZES 环境变量不是合法整数列表，退出。")
+        return 1
+    sizes = [s for s in sizes if s > 0]
+    if not sizes:
+        print("[启动] ❌ SIZES 为空或全为非正数，退出。")
+        return 1
 
     print("================ 开始并发评测 ================")
     if not await ensure_image():

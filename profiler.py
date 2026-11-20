@@ -18,6 +18,7 @@ import csv
 import glob
 import io
 import os
+import re
 import shutil
 
 # 要抓取的 ncu 指标（在 Blackwell sm_120 上稳定存在，均为 ncu 文档化指标）。
@@ -44,6 +45,18 @@ DRAM_BOUND_PCT = 60.0    # 显存带宽利用率 >= 60% 视为「显存读取很
 SM_SATURATED_PCT = 60.0  # SM 占用率 >= 60% 视为「计算单元吃满」
 
 
+def _ncu_version_key(path: str) -> tuple[int, ...]:
+    """从 ~/.local/nsight-compute/<ver>/ncu 提取版本号元组，供按版本数值排序。
+
+    直接字符串排序会把 "2026.10" 排到 "2026.4" 后面（'1' < '4'），选错旧版；
+    按元组比较才是正确语义（2026,10）>（2026,4）。
+    """
+    m = re.search(r"nsight-compute[/\\]([0-9]+(?:\.[0-9]+)*)[/\\]", path or "")
+    if not m:
+        return ()
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
 def list_ncu_candidates(env: dict | None = None) -> list[str]:
     """返回候选 ncu 二进制路径（按优先级，纯函数、不跑子进程）。
 
@@ -66,8 +79,8 @@ def list_ncu_candidates(env: dict | None = None) -> list[str]:
         candidates.append(explicit)
     home = os.path.expanduser("~")
     pattern = os.path.join(home, ".local", "nsight-compute", "*", "ncu")
-    # glob 按字典序排列，"2024.1.0" < "2026.4.0"，reverse=True 使新版在前。
-    for path in sorted(glob.glob(pattern), reverse=True):
+    # 按版本号数值新→旧排序（字符串排序会把 2026.10 排到 2026.4 之后，见 _ncu_version_key）。
+    for path in sorted(glob.glob(pattern), key=_ncu_version_key, reverse=True):
         candidates.append(path)
     which = shutil.which("ncu")
     if which and which not in candidates:

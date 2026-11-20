@@ -120,11 +120,18 @@ DEFAULT_STRATEGY_DIR = os.path.join(
 
 
 def load_cards(card_dir: str) -> list[dict]:
-    """加载 card_dir 下所有 *.json 策略卡，按路径排序返回；目录缺失返回 []。"""
+    """加载 card_dir 下所有 *.json 策略卡，按路径排序返回；目录缺失返回 []。
+
+    单张卡 JSON 损坏时跳过并告警，而不是让整批评测崩溃（merge 中断/手工编辑都可能留下
+    半截文件；坏卡跳过等价于「该知识不可用」，其余卡照常检索）。
+    """
     cards = []
     for path in sorted(glob.glob(os.path.join(card_dir, "*.json"))):
-        with open(path, encoding="utf-8") as f:
-            cards.append(json.load(f))
+        try:
+            with open(path, encoding="utf-8") as f:
+                cards.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"⚠️ 跳过无法加载的策略卡 {path}: {e}")
     return cards
 
 
@@ -544,6 +551,41 @@ def _update_file_has_missing(path: str, missing: set[str]) -> bool:
     return bool(missing & set((data.get("updates") or {}).keys()))
 
 
+def consume_update_files(results_dir: str, missing_ids) -> list[str]:
+    """消费已合并的 knowledge_updates_*.json，只保留「缺失卡」的增量。
+
+    P1 修复：此前含缺失卡的文件整份保留，导致同一文件里**已合并**卡的 delta 在下次
+    merge 时被二次叠加。这里把已合并卡的增量从文件中剔除，只留下缺失卡的增量再写回；
+    没有剩余增量的文件才删除。损坏的更新文件保留不删（宁可人工检查，不静默丢数据）。
+    返回仍被保留的更新文件路径（下次 merge 继续处理）。
+    """
+    mset = {str(c) for c in (missing_ids or [])}
+    kept: list[str] = []
+    pattern = os.path.join(results_dir, "*", "knowledge_updates_*.json")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            kept.append(path)
+            continue
+        remain = {
+            cid: upd for cid, upd in (data.get("updates") or {}).items()
+            if cid in mset
+        }
+        if not remain:
+            os.remove(path)
+            continue
+        data["updates"] = remain
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            kept.append(path)
+        except OSError:
+            kept.append(path)
+    return kept
+
+
 def apply_updates(strategies_dir: str, updates: dict[str, dict], dry_run: bool = False) -> list[str]:
     """把聚合后的置信度增量与证据写回策略卡；返回被修改的卡 id 列表。
 
@@ -639,13 +681,12 @@ def _cli() -> int:
         missing = missing_card_ids(agg, args.strategies)
         if missing:
             print(f"⚠️ 以下 {len(missing)} 张卡不存在，增量未合并、其更新文件已保留：{sorted(missing)}")
-        # 消费已合并的更新文件（非 dry-run）；含缺失卡的更新文件保留，避免静默丢更新
+        # 消费已合并的更新文件（非 dry-run）：只保留缺失卡的增量，已合并卡的
+        # 增量从文件中剔除，避免下次 merge 对同一张卡二次叠加 delta。
         if not args.dry_run:
-            mset = set(missing)
-            for path in sorted(glob.glob(os.path.join(args.results, "*", "knowledge_updates_*.json"))):
-                if _update_file_has_missing(path, mset):
-                    continue
-                os.remove(path)
+            kept = consume_update_files(args.results, missing)
+            if kept:
+                print(f"保留 {len(kept)} 个含缺失卡的更新文件，待缺失卡补齐后再合并。")
         return 0
 
     if args.cmd == "promote":

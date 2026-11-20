@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 
@@ -63,8 +64,18 @@ def should_update_best(best_ok: bool, best_time: float | None, new_time: float |
 
 
 def sanitize_float(v: float | None) -> float | None:
-    """NaN -> None（json.dump 默认会写非法 NaN），其余原样。"""
-    return None if (v is not None and v != v) else v
+    """非有限值（NaN/Inf）-> None，其余原样。
+
+    json.dump 默认会写出非法 JSON 的 NaN/Infinity；落盘前统一清洗。
+    无法转成 float 的输入原样返回（调用方语义不变）。
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    return None if not math.isfinite(f) else v
 
 
 def compute_speedup(prev_time, cur_time) -> float | None:
@@ -78,7 +89,7 @@ def compute_speedup(prev_time, cur_time) -> float | None:
         c = float(cur_time)
     except (TypeError, ValueError):
         return None
-    if p != p or c != c:   # NaN
+    if not (math.isfinite(p) and math.isfinite(c)):   # NaN / ±Inf
         return None
     if p <= 0 or c <= 0:
         return None

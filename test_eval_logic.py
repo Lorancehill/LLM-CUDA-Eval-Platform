@@ -171,6 +171,21 @@ def test_persist_result_writes_json_and_index():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sanitize_float_non_finite():
+    # P1：json 不接受 NaN/Inf；统一清洗为 None
+    assert eval_logic.sanitize_float(float("nan")) is None
+    assert eval_logic.sanitize_float(float("inf")) is None
+    assert eval_logic.sanitize_float(float("-inf")) is None
+    assert eval_logic.sanitize_float(1.25) == 1.25
+    assert eval_logic.sanitize_float(None) is None
+
+
+def test_compute_speedup_rejects_non_finite():
+    assert eval_logic.compute_speedup(float("inf"), 1.0) is None
+    assert eval_logic.compute_speedup(1.0, float("nan")) is None
+    assert eval_logic.compute_speedup(1.0, 0.5) == 2.0
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

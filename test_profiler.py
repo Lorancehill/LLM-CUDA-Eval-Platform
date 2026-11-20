@@ -59,6 +59,13 @@ def test_build_ncu_cmd_uses_custom_bin():
     assert profiler.build_ncu_cmd("test_1024").startswith("ncu --csv")
 
 
+def test_ncu_version_key_orders_numerically():
+    # 字符串排序会误判 2026.10 < 2026.4；按版本元组才是新版在前
+    newer = profiler._ncu_version_key("/h/.local/nsight-compute/2026.10/ncu")
+    older = profiler._ncu_version_key("/h/.local/nsight-compute/2026.4/ncu")
+    assert newer > older
+
+
 def test_list_ncu_candidates_explicit_first():
     cands = profiler.list_ncu_candidates({"NCU_BIN": "/opt/ncu/custom"})
     assert cands[0] == "/opt/ncu/custom"

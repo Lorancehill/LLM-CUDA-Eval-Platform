@@ -39,9 +39,21 @@ def _kb_enabled(kb: str) -> bool:
 
 
 def build_cells(args) -> list[dict]:
-    """展开 (kb × repeat) 跑批矩阵。每个 cell 对应一个独立子进程。"""
-    sizes = [int(x) for x in args.sizes.split(",") if x.strip()]
+    """展开 (kb × repeat) 跑批矩阵。每个 cell 对应一个独立子进程。
+
+    参数非法时抛 ValueError（由 main 统一转成退出码 2），避免空矩阵后续 cells[0] 崩溃。
+    """
+    try:
+        sizes = [int(x) for x in args.sizes.split(",") if x.strip()]
+    except ValueError as e:
+        raise ValueError(f"--sizes 不是合法整数列表：{args.sizes!r}") from e
+    if not sizes or any(s <= 0 for s in sizes):
+        raise ValueError(f"--sizes 必须是非空正整数列表：{args.sizes!r}")
     kbs = [x for x in args.kb.split(",") if x.strip()]
+    if not kbs:
+        raise ValueError("--kb 不能为空（例如 0,1）")
+    if args.repeats < 1:
+        raise ValueError(f"--repeats 必须 >= 1：{args.repeats}")
     cells = []
     for kb in kbs:
         cond = f"{args.cond}{kb}"
@@ -262,7 +274,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不真正执行")
     args = ap.parse_args()
 
-    cells = build_cells(args)
+    try:
+        cells = build_cells(args)
+    except ValueError as e:
+        print(f"参数错误：{e}", file=sys.stderr)
+        return 2
     print(f"实验 {args.exp}：{len(cells)} 个 run = "
           f"{len(set(c['kb'] for c in cells))} kb 条件 × {args.repeats} 重复，"
           f"尺寸 {args.sizes}，模型 {args.model or 'deepseek-chat（默认）'}")

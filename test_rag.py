@@ -353,6 +353,65 @@ def test_missing_card_ids_and_update_file_has_missing():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_load_cards_skips_malformed_json():
+    tmp = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(tmp, "C1.json"), "w") as f:
+            json.dump(make_card("C1"), f)
+        with open(os.path.join(tmp, "BAD.json"), "w") as f:
+            f.write("{ this is not json")
+        cards = rag.load_cards(tmp)
+        assert [c["id"] for c in cards] == ["C1"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_consume_update_files_keeps_only_missing_cards():
+    """P1：含缺失卡的更新文件不能整份保留，否则已合并卡的 delta 会被二次叠加。"""
+    tmp = tempfile.mkdtemp()
+    try:
+        strategies = os.path.join(tmp, "strategies")
+        run_dir = os.path.join(tmp, "results", "run-1")
+        os.makedirs(strategies)
+        os.makedirs(run_dir)
+        with open(os.path.join(strategies, "C1.json"), "w") as f:
+            json.dump(make_card("C1"), f)
+        path = os.path.join(run_dir, "knowledge_updates_256.json")
+        with open(path, "w") as f:
+            json.dump({"run_id": "run-1", "matrix_size": 256, "updates": {
+                "C1": {"delta": 0.05, "evidence": []},
+                "GHOST": {"delta": -0.05, "evidence": []},
+            }}, f)
+
+        kept = rag.consume_update_files(os.path.join(tmp, "results"), ["GHOST"])
+        assert len(kept) == 1 and kept[0] == path
+        with open(path) as f:
+            data = json.load(f)
+        # 已合并的 C1 被剔除，只留缺失卡 GHOST，避免下次 merge 二次叠加
+        assert set(data["updates"]) == {"GHOST"}
+        agg = rag.load_updates(os.path.join(tmp, "results"))
+        assert "C1" not in agg and "GHOST" in agg
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_consume_update_files_removes_fully_merged_file():
+    tmp = tempfile.mkdtemp()
+    try:
+        run_dir = os.path.join(tmp, "results", "run-2")
+        os.makedirs(run_dir)
+        path = os.path.join(run_dir, "knowledge_updates_512.json")
+        with open(path, "w") as f:
+            json.dump({"run_id": "run-2", "matrix_size": 512, "updates": {
+                "C1": {"delta": 0.05, "evidence": []},
+            }}, f)
+        kept = rag.consume_update_files(os.path.join(tmp, "results"), [])
+        assert kept == []
+        assert not os.path.exists(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
