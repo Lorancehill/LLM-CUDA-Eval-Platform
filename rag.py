@@ -4,7 +4,7 @@
 - 知识表示：knowledge/strategies/*.json，一张卡 = 一个可执行优化策略 + 适用条件 + 证据。
 - 检索不是纯文本相似，而是「硬过滤（算子族 + 瓶颈指纹 + 语义约束）+ 软打分（BM25）+
   先验加权（置信度 + 近因）」。
-- 全部纯函数，离线可单测；不 import async_eval（它 import 即创建 API client）。
+- 全部纯函数，离线可单测；不 import async_eval（避免拖入评测编排依赖，保持离线可单测）。
 
 卡片 schema（对应设计文档 §1 的 YAML，改用 JSON 以保持零新依赖）：
   id, version, status, operator_family, semantics{shape,dtype,tolerance},

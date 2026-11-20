@@ -20,10 +20,24 @@ import rag
 
 load_dotenv()
 
-client = AsyncOpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
-)
+# 惰性构造 AsyncOpenAI：其构造阶段 httpx2 会读取环境代理（含 ALL_PROXY），
+# 若代理配置与依赖不符（如 socks5 代理缺 socksio）会在此抛 ImportError，导致
+# 模块导入即崩，连无需 API 的路径（SIZES 非法 / 镜像不可用提前退出）也被拖垮。
+# 改为首次真正调用 API 时才构造，且只构造一次。
+# 模块级 client 同时是测试注入点：test_* 通过 setattr(async_eval, "client", fake) 注入假 client。
+client = None
+
+
+def _get_client():
+    """返回缓存的 AsyncOpenAI 客户端；首次调用时才构造。"""
+    global client
+    if client is None:
+        client = AsyncOpenAI(
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
+        )
+    return client
+
 
 # 限制同时最多 1 个任务占用 GPU
 gpu_sem = asyncio.Semaphore(1)
@@ -168,7 +182,7 @@ async def _chat_completion(messages):
     last_err = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            response = await client.chat.completions.create(
+            response = await _get_client().chat.completions.create(
                 model=MODEL_NAME, messages=messages, timeout=API_TIMEOUT_SECONDS
             )
             return response, _usage_dict(getattr(response, "usage", None)), None
