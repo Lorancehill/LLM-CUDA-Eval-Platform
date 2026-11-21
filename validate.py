@@ -61,7 +61,7 @@ def default_tolerance(N: int) -> tuple[float, float] :
     """
     按尺寸校准的比较容差 (rtol, atol)。
 
-    float32 顺序累加舍入误差近似随 N 线性增长（gamma_N ≈ N*eps32），固定 1e-5
+    float32 顺序累加舍入误差近似随 N 线性增长（gamma_N ≈ N * eps32），固定 1e-5
     在 2048 会把正确内核误判为错误。这里 rtol 随 N 线性放大，atol 只兜底零附近。
     """
     _validate_size(N)
@@ -83,6 +83,7 @@ def load_matrix(path, N: int) -> np.ndarray :
         ValueError: 文件不可读、字节数 != N*N*4、或元素数 != N*N。
     """
     _validate_size(N)
+    
     expected_elems = N * N
     expected_bytes = expected_elems * 4
 
@@ -97,7 +98,7 @@ def load_matrix(path, N: int) -> np.ndarray :
         )
 
     try :
-        data = np.fromfile(path, dtype=np.float32)
+        data = np.fromfile(path, dtype = np.float32)
     except OSError as exc :
         raise ValueError(f"无法读取矩阵文件 {path!r}: {exc}") from exc
     if data.size != expected_elems :
@@ -129,7 +130,7 @@ def matrices_close(ref: np.ndarray, got: np.ndarray,
         return False, float("nan")
     if ref.size == 0 :
         raise ValueError("空矩阵（任一维为 0）不支持，N 应 >= 1")
-    if not np.all(np.isfinite(got)):
+    if not np.all(np.isfinite(got)) :
         return False, float("nan")
     return (
         bool(np.allclose(ref, got, rtol = rtol, atol = atol)),
@@ -144,7 +145,7 @@ def matrices_close_details(ref: np.ndarray, got: np.ndarray,
     返回 dict（全部为 Python 原生类型，可直接 JSON 落盘）：
         ok:            bool，判定是否通过；
         max_diff:      float，最大绝对误差（= matrices_close 的第二返回值）；
-        max_ratio:     float，"max(|ref-got| / (atol + rtol*|got|))"，>= 1 即失败；
+        max_ratio:     float，"max(|ref - got| / (atol + rtol*|got|))"，>= 1 即失败；
         n_violations:  int，超阈值元素个数；
         worst_index:   tuple[int, ...] 或 None，max_ratio 所在下标。
 
