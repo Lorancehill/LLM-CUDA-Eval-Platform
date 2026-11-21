@@ -1,4 +1,5 @@
-"""评测纯逻辑：耗时解析、best-so-far 判据、结果落盘（results schema v2）。
+"""
+评测纯逻辑：耗时解析、best-so-far 判据、结果落盘（results schema v2）。
 
 从 async_eval 抽出，便于在**不导入 async_eval**（它 import 即创建 API client）的前提下
 单测这些逻辑。函数不依赖 GPU / Docker / API。
@@ -10,7 +11,6 @@ import json
 import math
 import os
 import re
-
 
 _TIME_RE = re.compile(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
 
@@ -29,81 +29,93 @@ _PTXAS_ERR_RE = re.compile(
 )
 
 
-def parse_time_seconds(stdout_str: str) -> float | None:
-    """从 CUDA 输出解析 'Time: xxx seconds' 中的秒数；无匹配返回 None。"""
+def parse_time_seconds(stdout_str: str) -> float | None :
+    """
+    从 CUDA 输出解析 'Time: xxx seconds' 中的秒数；无匹配返回 None。
+    """
     m = _TIME_RE.search(stdout_str or "")
+
     return float(m.group(1)) if m else None
 
 
-def parse_time_seconds_median(stdout_str: str) -> float | None:
-    """解析全部 'Time: xxx seconds' 并返回中位数（论文计时口径：多次重复取中位数，
-    抗首轮冷启动/偶发抖动）；无匹配返回 None。"""
+def parse_time_seconds_median(stdout_str: str) -> float | None :
+    """
+    解析全部 'Time: xxx seconds' 并返回中位数（论文计时口径：多次重复取中位数，
+    抗首轮冷启动/偶发抖动）；无匹配返回 None。
+    """
     vals = [float(m.group(1)) for m in _TIME_RE.finditer(stdout_str or "")]
-    if not vals:
+    if not vals :
         return None
+
     vals.sort()
+
     n = len(vals)
     mid = n // 2
+
     return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
-def should_update_best(best_ok: bool, best_time: float | None, new_time: float | None) -> bool:
-    """best-so-far 更新判据（纯函数）。
+def should_update_best(best_ok: bool, best_time: float | None, new_time: float | None) -> bool :
+    """
+    best-so-far 更新判据（纯函数）。
 
-    - 尚无正确结果（best_ok=False）：无条件记录（首个正确结果）。
+    - 尚无正确结果（best_ok = False）：无条件记录（首个正确结果）。
     - 已有正确结果：
         - 旧耗时缺失、新耗时存在 → 更新（能测得就更可信，补齐缺失计时）；
         - 新旧都测得且新耗时严格更小 → 更新；
         - 否则（无法证明更快）保留旧 best，避免被改坏的内核「反杀」。
     """
-    if not best_ok:
+    if not best_ok :
         return True
-    if best_time is None:
+    if best_time is None :
         return new_time is not None
     return new_time is not None and new_time < best_time
 
 
-def sanitize_float(v: float | None) -> float | None:
-    """非有限值（NaN/Inf）-> None，其余原样。
+def sanitize_float(v: float | None) -> float | None :
+    """
+    非有限值（NaN/Inf）-> None，其余原样。
 
     json.dump 默认会写出非法 JSON 的 NaN/Infinity；落盘前统一清洗。
     无法转成 float 的输入原样返回（调用方语义不变）。
     """
-    if v is None:
+    if v is None :
         return None
-    try:
+    try :
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) :
         return v
     return None if not math.isfinite(f) else v
 
 
-def compute_speedup(prev_time, cur_time) -> float | None:
-    """加速比 = prev_time / cur_time（>1 更快，<1 更慢，==1 持平）。
+def compute_speedup(prev_time, cur_time) -> float | None :
+    """
+    加速比 = prev_time / cur_time（>1 更快，<1 更慢，==1 持平）。
 
     两者都必须是正的有限数才可比较；否则返回 None（无法比较）。
     用于记录「本轮相对上一成功轮的提速」，与 best-so-far 的绝对保优判据互补。
     """
-    try:
+    try :
         p = float(prev_time)
         c = float(cur_time)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) :
         return None
-    if not (math.isfinite(p) and math.isfinite(c)):   # NaN / ±Inf
+    if not (math.isfinite(p) and math.isfinite(c)) :   # NaN / ±Inf
         return None
-    if p <= 0 or c <= 0:
+    if p <= 0 or c <= 0 :
         return None
     return p / c
 
 
-def extract_compile_errors(text: str) -> list[dict]:
-    """从 nvcc / g++ / ptxas 编译输出里提取结构化报错行（file/line/severity/message）。
+def extract_compile_errors(text: str) -> list[dict] :
+    """
+    从 nvcc / g++ / ptxas 编译输出里提取结构化报错行（file/line/severity/message）。
 
     自我纠错闭环用：把「具体行号 + 报错原因」喂回模型，而不是只给 stderr 尾部 300 字符。
     覆盖三种形态（示例见 _NVCC_ERR_RE / _GCC_ERR_RE / _PTXAS_ERR_RE）：
-    - nvcc：``matrix_mul_256.cu(12): error: identifier "foo" is undefined``
-    - 宿主 g++：``/tmp/.../main.cu:12:5: error: 'foo' was not declared``
-    - ptxas（编译期、无行号）：``ptxas error : Entry function ... uses too much shared data``
+    - nvcc："matrix_mul_256.cu(12): error: identifier "foo" is undefined"
+    - 宿主 g++："/tmp/.../main.cu:12:5: error: 'foo' was not declared"
+    - ptxas（编译期、无行号）："ptxas error : Entry function ... uses too much shared data"
     无匹配返回空列表。
     """
     out = []
