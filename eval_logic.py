@@ -11,25 +11,39 @@ import json
 import math
 import os
 import re
+from typing import Any, Literal, TypedDict
 
-_TIME_RE = re.compile(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
+
+class CompileError(TypedDict):
+    """一条结构化编译错误（extract_compile_errors 的返回元素）。"""
+
+    file: str | None
+    line: int | None
+    severity: str
+    message: str
+    source: str
+
+
+FailureKind = Literal["timeout", "run_failed", "no_output", "wrong_result"]
+
+_TIME_RE: re.Pattern[str] = re.compile(r"Time:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
 
 # 编译器报错行（自我纠错闭环用，见 extract_compile_errors）。
 # ① nvcc：matrix_mul_256.cu(12): error: identifier "foo" is undefined
 # ② 宿主 g++：/tmp/.../main.cu:12:5: error: 'foo' was not declared in this scope
 # ③ ptxas（编译期、无行号）：ptxas error   : Entry function ... uses too much shared data
-_NVCC_ERR_RE = re.compile(
+_NVCC_ERR_RE: re.Pattern[str] = re.compile(
     r"(?P<file>[^\s(),:]+)?\s*\((?P<line>\d+)\):\s*(?P<sev>error|warning|note):\s*(?P<msg>.*)"
 )
-_GCC_ERR_RE = re.compile(
+_GCC_ERR_RE: re.Pattern[str] = re.compile(
     r"(?P<file>[^\s():,]+):(?P<line>\d+)(?::\d+)?:\s*(?P<sev>fatal error|error|warning|note):\s*(?P<msg>.*)"
 )
-_PTXAS_ERR_RE = re.compile(
+_PTXAS_ERR_RE: re.Pattern[str] = re.compile(
     r"\bptxas\s+(?P<sev>fatal|error|warning)\s*:\s*(?P<msg>.*)"
 )
 
 
-def parse_time_seconds(stdout_str: str) -> float | None :
+def parse_time_seconds(stdout_str: str | None) -> float | None :
     """
     从 CUDA 输出解析 'Time: xxx seconds' 中的秒数；无匹配返回 None。
     """
@@ -38,7 +52,7 @@ def parse_time_seconds(stdout_str: str) -> float | None :
     return float(m.group(1)) if m else None
 
 
-def parse_time_seconds_median(stdout_str: str) -> float | None :
+def parse_time_seconds_median(stdout_str: str | None) -> float | None :
     """
     解析全部 'Time: xxx seconds' 并返回中位数（论文计时口径：多次重复取中位数，
     抗首轮冷启动/偶发抖动）；无匹配返回 None。
@@ -88,7 +102,7 @@ def sanitize_float(v: float | None) -> float | None :
     return None if not math.isfinite(f) else v
 
 
-def compute_speedup(prev_time, cur_time) -> float | None :
+def compute_speedup(prev_time: float | int | None, cur_time: float | int | None) -> float | None :
     """
     加速比 = prev_time / cur_time（>1 更快，<1 更慢，==1 持平）。
 
@@ -107,7 +121,7 @@ def compute_speedup(prev_time, cur_time) -> float | None :
     return p / c
 
 
-def extract_compile_errors(text: str) -> list[dict] :
+def extract_compile_errors(text: str | None) -> list[CompileError] :
     """
     从 nvcc / g++ / ptxas 编译输出里提取结构化报错行（file/line/severity/message）。
 
@@ -118,8 +132,8 @@ def extract_compile_errors(text: str) -> list[dict] :
     - ptxas（编译期、无行号）："ptxas error : Entry function ... uses too much shared data"
     无匹配返回空列表。
     """
-    out = []
-    for m in _NVCC_ERR_RE.finditer(text or ""):
+    out: list[CompileError] = []
+    for m in _NVCC_ERR_RE.finditer(text or "") :
         out.append({
             "file": m.group("file") or None,
             "line": int(m.group("line")),
@@ -127,7 +141,7 @@ def extract_compile_errors(text: str) -> list[dict] :
             "message": (m.group("msg") or "").strip(),
             "source": "nvcc",
         })
-    for m in _GCC_ERR_RE.finditer(text or ""):
+    for m in _GCC_ERR_RE.finditer(text or "") :
         out.append({
             "file": m.group("file") or None,
             "line": int(m.group("line")),
@@ -135,7 +149,7 @@ def extract_compile_errors(text: str) -> list[dict] :
             "message": (m.group("msg") or "").strip(),
             "source": "gcc",
         })
-    for m in _PTXAS_ERR_RE.finditer(text or ""):
+    for m in _PTXAS_ERR_RE.finditer(text or "") :
         out.append({
             "file": None,
             "line": None,
@@ -146,10 +160,17 @@ def extract_compile_errors(text: str) -> list[dict] :
     return out
 
 
-def build_error_feedback(errors, source_context, kind, *, returncode=None,
-                         max_diff=None, out_bin=None, timeout=None,
-                         stdout_tail="", stderr_tail=""):
-    """按失败类别拼装自我纠错反馈（纯函数，供闭环把报错喂回模型）。
+def build_error_feedback(errors: list[CompileError] | None,
+                         source_context: str | None,
+                         kind: FailureKind, *,
+                         returncode: int | None = None,
+                         max_diff: float | None = None,
+                         out_bin: str | None = None,
+                         timeout: int | float | None = None,
+                         stdout_tail: str = "",
+                         stderr_tail: str = "") -> str :
+    """
+    按失败类别拼装自我纠错反馈（纯函数，供闭环把报错喂回模型）。
 
     - errors：extract_compile_errors 的结构化列表（可为空）。
     - source_context：出错行附近的 .cu 源码片段（可 None，由上层读文件传入）。
@@ -157,21 +178,21 @@ def build_error_feedback(errors, source_context, kind, *, returncode=None,
     有结构化编译错误时，优先用「行号 + 报错原因 + 出错行源码」；
     否则回落到 stdout/stderr 尾部（兜底，避免空反馈）。
     """
-    def _compile_block():
-        if not errors:
+    def _compile_block() -> str :
+        if not errors :
             return ""
         lines = ["编译器报错如下："]
-        for e in errors[:5]:  # 只喂前 5 条，避免超长稀释关键信息
+        for e in errors[:5] :  # 只喂前 5 条，避免超长稀释关键信息
             loc = e.get("file") or "你的 .cu 文件"
-            if e.get("line") is not None:
+            if e.get("line") is not None :
                 loc = f"{loc}:{e['line']}"
             lines.append(f"  - {loc} [{e['severity']}] {e['message']}")
         block = "\n".join(lines)
-        if source_context:
+        if source_context :
             block += "\n\n出错行附近的源码：\n" + source_context
         return block
 
-    if kind == "timeout":
+    if kind == "timeout" :
         return (
             f"你上次的 CUDA 代码在 {timeout} 秒内未跑完（超时被强杀）。\n"
             f"[运行输出尾部]\n{stdout_tail}\n"
@@ -179,7 +200,7 @@ def build_error_feedback(errors, source_context, kind, *, returncode=None,
             f"可能是算法太慢（如 naive 三重循环）或存在死循环，请优化 kernel 后重新提供完整代码。"
         )
 
-    if kind == "no_output":
+    if kind == "no_output" :
         return (
             f"你上次写的代码能编译运行，但没有输出结果矩阵 {out_bin}。\n"
             f"[stdout 尾部]\n{stdout_tail}\n"
@@ -187,7 +208,7 @@ def build_error_feedback(errors, source_context, kind, *, returncode=None,
             f"请确认 fwrite 写入了 {out_bin}，修复后重新提供完整的 CUDA 代码。"
         )
 
-    if kind == "wrong_result":
+    if kind == "wrong_result" :
         # P1（3.3）：NaN 输出被正确判失败时，max_diff 可能是 NaN，直接格式化会出「nan」。
         md = sanitize_float(max_diff)
         diff_txt = f"{md:.6g}" if md is not None else "非有限值（NaN/Inf，结果矩阵含非法数值）"
@@ -198,7 +219,7 @@ def build_error_feedback(errors, source_context, kind, *, returncode=None,
 
     # run_failed：编译/运行失败，优先结构化编译错误，否则兜底尾部
     compile_block = _compile_block()
-    if compile_block:
+    if compile_block :
         return (
             f"你的代码在 Docker 沙箱中编译/运行失败（退出码 {returncode}）。\n"
             f"{compile_block}\n"
@@ -212,15 +233,23 @@ def build_error_feedback(errors, source_context, kind, *, returncode=None,
     )
 
 
-def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_version,
-                         best, records, env_snapshot, knowledge=None):
-    """构造 results schema v2 的落盘 payload（纯函数，不做 I/O）。
+def build_result_payload(run_id: str,
+                         timestamp: str,
+                         matrix_size: int,
+                         model_name: str,
+                         prompt_version: str,
+                         best: dict[str, Any],
+                         records: list[dict[str, Any]],
+                         env_snapshot: dict[str, Any],
+                         knowledge: dict[str, Any] | None = None) -> dict[str, Any] :
+    """
+    构造 results schema v2 的落盘 payload（纯函数，不做 I/O）。
 
     schema v2 相比 v1 新增：run_id / timestamp / model 真实名（response.model，逐轮在
     attempts 里）/ prompt 版本 / 环境快照 / 每轮 code 全文与错误反馈，支撑
     「100 组数据」的论文复现与「瓶颈→策略→收益」证据链回溯。
     """
-    def clean_best(b):
+    def clean_best(b: dict[str, Any]) -> dict[str, Any] :
         return {
             "attempt": b.get("attempt"),
             "cu_filename": b.get("cu_filename"),
@@ -235,7 +264,7 @@ def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_vers
             "feedback": b.get("feedback"),
         }
 
-    def clean_record(r):
+    def clean_record(r: dict[str, Any]) -> dict[str, Any] :
         return {
             **r,
             "max_diff": sanitize_float(r.get("max_diff")),
@@ -257,18 +286,22 @@ def build_result_payload(run_id, timestamp, matrix_size, model_name, prompt_vers
     }
 
 
-def write_result_json(payload: dict, results_dir: str) -> str:
-    """写入 results/{run_id}/{N}.json，返回路径。"""
+def write_result_json(payload: dict[str, Any], results_dir: str) -> str :
+    """
+    写入 results/{run_id}/{N}.json，返回路径。
+    """
     run_dir = os.path.join(results_dir, str(payload["run_id"]))
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok = True)
     path = os.path.join(run_dir, f"{payload['matrix_size']}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    with open(path, "w", encoding = "utf-8") as f:
+        json.dump(payload, f, ensure_ascii = False, indent = 2, default = str)
     return path
 
 
-def append_run_index(payload: dict, results_dir: str) -> str:
-    """向 results/index.jsonl 追加一行 run 汇总，返回索引路径。"""
+def append_run_index(payload: dict[str, Any], results_dir: str) -> str :
+    """
+    向 results/index.jsonl 追加一行 run 汇总，返回索引路径。
+    """
     index_path = os.path.join(results_dir, "index.jsonl")
     summary = {
         "run_id": payload["run_id"],
@@ -279,13 +312,15 @@ def append_run_index(payload: dict, results_dir: str) -> str:
         "best_attempt": payload["best"].get("attempt"),
         "best_effective_time": sanitize_float(payload["best"].get("effective_time")),
     }
-    with open(index_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(summary, ensure_ascii=False, default=str) + "\n")
+    with open(index_path, "a", encoding = "utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii = False, default = str) + "\n")
     return index_path
 
 
-def persist_result(payload: dict, results_dir: str) -> tuple[str, str]:
-    """写入 results/{run_id}/{N}.json 并追加 results/index.jsonl，返回 (json_path, index_path)。"""
+def persist_result(payload: dict[str, Any], results_dir: str) -> tuple[str, str]:
+    """
+    写入 results/{run_id}/{N}.json 并追加 results/index.jsonl，返回 (json_path, index_path)。
+    """
     path = write_result_json(payload, results_dir)
     index_path = append_run_index(payload, results_dir)
     return path, index_path
