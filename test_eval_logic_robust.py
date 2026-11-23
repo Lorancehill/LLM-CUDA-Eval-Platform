@@ -147,7 +147,9 @@ def test_persist_result_end_to_end():
             assert json.load(f)["run_id"] == "run-rob"
         with open(index_path, encoding="utf-8") as f:
             line = f.read().strip()
-        assert json.loads(line)["run_id"] == "run-rob"
+        summary = json.loads(line)
+        assert summary["run_id"] == "run-rob"
+        assert summary["schema_version"] == eval_logic.SCHEMA_VERSION
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

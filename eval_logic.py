@@ -420,7 +420,7 @@ def append_run_index(payload: dict[str, Any], results_dir: str) -> str :
     向 results/index.jsonl 追加一行 run 汇总，返回索引路径。
 
     用 O_APPEND + 单次 write（循环写完）追加整行，降低多尺寸并发写 index 的交错风险；
-    行内容与旧实现逐字节一致。
+    在旧字段基础上新增 schema_version，供看板/分析脚本做版本兼容（旧行无该字段仍可读）。
     """
     if not isinstance(payload, dict) :
         raise TypeError(f"payload 必须是 dict，实际是 {type(payload).__name__}")
@@ -433,6 +433,7 @@ def append_run_index(payload: dict[str, Any], results_dir: str) -> str :
     os.makedirs(results_dir or ".", exist_ok = True)
 
     summary = {
+        "schema_version": SCHEMA_VERSION,
         "run_id": payload.get("run_id"),
         "timestamp": payload.get("timestamp"),
         "matrix_size": payload.get("matrix_size"),
