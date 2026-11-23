@@ -22,8 +22,10 @@ from typing import Any, Literal, TypedDict
 SCHEMA_VERSION = 2
 
 
-class CompileError(TypedDict):
-    """一条结构化编译错误（extract_compile_errors 的返回元素）。"""
+class CompileError(TypedDict) :
+    """
+    一条结构化编译错误（extract_compile_errors 的返回元素）。
+    """
 
     file: str | None
     line: int | None
