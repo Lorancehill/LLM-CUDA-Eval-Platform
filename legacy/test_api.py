@@ -2,7 +2,12 @@ from openai import OpenAI
 import re
 import subprocess
 import os
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
+
+# 允许从 legacy/ 目录运行：把仓库根目录加入 sys.path，才能 import validate
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import validate
 

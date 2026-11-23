@@ -53,7 +53,9 @@ python rag.py promote --dry-run
 | `dashboard.py` | 零依赖网页看板 |
 | `run_experiment.py` | 批跑脚本（注入实验标签，归档 logs/runs/summary.csv） |
 | `preflight.py` | 环境预检 |
-| `micro_bench_unroll.py` | loop-unrolling 微基准 |
+| `tools/micro_bench_unroll.py` | loop-unrolling 微基准 |
+| `baselines/` | 手写 C / PyTorch 基准（`baseline_C.c`、`baseline_torch.py`） |
+| `legacy/` | 早期脚本（`auto_test.sh`、`test_api.py`、`test_concurrency.py`，已弃用，仅存档） |
 | `knowledge/strategies/*.json` | 策略卡（curated） |
 | `knowledge/candidates/` | 自蒸馏候选卡（gitignore，人工 review） |
 | `results/` | 证据链落盘（gitignore） |
@@ -75,4 +77,10 @@ python -m compileall .
 
 - `ROADMAP.md`：技术路线与阶段计划
 - `NOTES.md`：科研愿景（MVP → 顶会）
+- `baselines/README.md`：手写基准说明
+- `legacy/README.md`：早期脚本说明（已弃用）
 - 设计与评审记录：见 `ROADMAP.md` 与 git 提交历史；如需归档，可把评估/评审文档放进 `改进反馈/` 目录
+
+## 许可证
+
+MIT © 2026 Lorancehill。详见 `LICENSE`。

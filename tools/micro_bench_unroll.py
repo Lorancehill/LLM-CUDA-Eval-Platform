@@ -10,9 +10,9 @@
   - 正确性：每个变体输出矩阵与 float64 参考比对（校准容差）
 
 用法：
-    python micro_bench_unroll.py                    # 跑全部变体
-    python micro_bench_unroll.py --only tiled1_16_4 # 只跑一个变体（调试）
-    python micro_bench_unroll.py --n 1024 --skip-ncu
+    python tools/micro_bench_unroll.py                    # 跑全部变体
+    python tools/micro_bench_unroll.py --only tiled1_16_4 # 只跑一个变体（调试）
+    python tools/micro_bench_unroll.py --n 1024 --skip-ncu
 
 输出：experiments/micro_unroll/{src,bin,logs}/ + results.csv + summary 打印。
 """
@@ -28,7 +28,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORK = os.path.join(HERE, "experiments", "micro_unroll")
+ROOT = os.path.dirname(HERE)          # 仓库根目录（本脚本在 tools/ 下）
+WORK = os.path.join(ROOT, "experiments", "micro_unroll")
 IMAGE = "nvidia/cuda:12.8.2-devel-ubuntu22.04"
 
 NCU_METRICS = [
@@ -347,7 +348,7 @@ def run_selftime(v: dict) -> tuple[float | None, str]:
 
 def check_correctness(n: int, work: str) -> tuple[bool, float | None, str]:
     """用仓库 validate.py 的 float64 参考 + 校准容差检查输出矩阵。"""
-    sys.path.insert(0, HERE)
+    sys.path.insert(0, ROOT)
     import validate
     path = os.path.join(work, f"cuda_output_{n}.bin")
     if not os.path.isfile(path):

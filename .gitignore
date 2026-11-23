@@ -19,6 +19,10 @@ matrix_mul*.cu
 # 忽略矩阵校验产生的二进制输出
 *.bin
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
 
 # 画像/分类/反馈证据链落盘目录（运行时产物）
 results/
